@@ -1,0 +1,12 @@
+{
+  "name": "reddit-monitor",
+  "version": "1.0.0",
+  "description": "AI-powered Reddit comment monitor with scoring and draft generation",
+  "scripts": {
+    "start": "node scraper.js",
+    "test": "node scraper.js"
+  },
+  "dependencies": {
+    "playwright": "^1.40.0"
+  }
+}
