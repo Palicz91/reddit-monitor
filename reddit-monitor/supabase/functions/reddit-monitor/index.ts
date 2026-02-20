@@ -284,6 +284,17 @@ function isRelevant(post: RedditPost, keywords: string[]): boolean {
   return keywords.some((kw) => text.includes(kw.toLowerCase()));
 }
 
+function getSubredditCounts(posts: RedditPost[]): string {
+  const counts: Record<string, number> = {};
+  for (const p of posts) {
+    counts[p.subreddit] = (counts[p.subreddit] || 0) + 1;
+  }
+  return Object.entries(counts)
+    .sort((a, b) => b[1] - a[1])
+    .map(([sub, count]) => `r/${sub}: ${count}`)
+    .join(', ');
+}
+
 // ── Main handler ──
 
 Deno.serve(async (req) => {
@@ -364,6 +375,53 @@ Deno.serve(async (req) => {
     debugInfo.alreadySeen = keywordMatched.length - relevant.length;
     debugInfo.relevantPosts = relevant.length;
 
+    // ── Early exit: no keyword matches ──
+    if (keywordMatched.length === 0) {
+      const report = `📭 <b>Run complete</b> – no keyword matches
+
+📥 ${allPosts.length} posts scraped (${unique.length} unique)
+🔑 ${config.keywords.length} keywords checked
+📊 ${getSubredditCounts(unique)}
+
+No posts matched any keywords this run.`;
+      await sendTelegram(report);
+      return new Response(
+        JSON.stringify({
+          success: true,
+          reason: 'no_keyword_matches',
+          totalReceived: allPosts.length,
+          uniquePosts: unique.length,
+          keywordMatches: 0,
+          keywordsUsed: config.keywords.length,
+          executionMs: Date.now() - handlerStart,
+          debug: debugInfo,
+        }),
+        { headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+
+    // ── Early exit: all keyword matches already seen ──
+    if (relevant.length === 0) {
+      const report = `📭 <b>Run complete</b> – nothing new
+
+📥 ${allPosts.length} posts scraped (${unique.length} unique)
+🔑 ${keywordMatched.length} keyword matches, all already seen`;
+      await sendTelegram(report);
+      return new Response(
+        JSON.stringify({
+          success: true,
+          reason: 'all_already_seen',
+          totalReceived: allPosts.length,
+          uniquePosts: unique.length,
+          keywordMatches: keywordMatched.length,
+          alreadySeen: keywordMatched.length,
+          executionMs: Date.now() - handlerStart,
+          debug: debugInfo,
+        }),
+        { headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+
     // Daily cap
     const draftsToday = await getDraftsToday();
     const slotsLeft = config.dailyDraftLimit - draftsToday;
@@ -399,16 +457,19 @@ Deno.serve(async (req) => {
     debugInfo.slotsLeft = slotsLeft;
 
     if (qualified.length === 0) {
-      if (debug) {
-        const topScores = scored
-          .sort((a, b) => b.result.score - a.result.score)
-          .slice(0, 5)
-          .map(({ post, result }) => `• ${result.score}/10: ${post.title.slice(0, 50)}`)
-          .join('\n');
-        await sendTelegram(
-          `📭 ${relevant.length} keyword matches, none scored ${config.minScore}+.\n\nTop scores:\n${topScores}`
-        );
-      }
+      const topScores = scored
+        .sort((a, b) => b.result.score - a.result.score)
+        .slice(0, 5)
+        .map(({ post, result }) => `• ${result.score}/10: ${escapeHtml(post.title.slice(0, 50))}`)
+        .join('\n');
+      const report = `📭 <b>Run complete</b> – no posts qualified
+
+📥 ${allPosts.length} posts (${unique.length} unique)
+🔑 ${keywordMatched.length} keyword matches → ${relevant.length} new
+🎯 None scored ${config.minScore}+
+
+Top scores:\n${topScores}`;
+      await sendTelegram(report);
     } else {
       const header = `🔔 <b>Reddit Monitor</b>\n${qualified.length} post${qualified.length > 1 ? 's' : ''} to comment on (${draftsToday}/${config.dailyDraftLimit} used today)\n\n💡 Copy the draft, tweak it, post it.`;
       await sendTelegram(header);
