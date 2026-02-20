@@ -11,7 +11,7 @@ Your Laptop (Playwright)  →  Supabase Edge Function  →  Telegram
 
 1. **Scraper** runs on your laptop every 3 hours (cron)
 2. Scrapes new posts from your chosen subreddits
-3. Sends posts to Supabase Edge Function
+3. Sends posts + your config to Supabase Edge Function
 4. Edge Function filters by keywords, scores with AI, generates draft comments
 5. You get a Telegram message with the post + draft comment to copy/paste
 
@@ -29,7 +29,7 @@ Your Laptop (Playwright)  →  Supabase Edge Function  →  Telegram
 
 ```bash
 git clone <this-repo>
-cd reddit-monitor
+cd desktop/scraper/reddit-monitor
 npm install
 npx playwright install chromium
 ```
@@ -86,12 +86,8 @@ Go to Supabase Dashboard → Edge Functions → reddit-monitor → Secrets, and 
 | `REDDIT_MONITOR_TG_CHAT_ID` | Your Telegram chat id |
 | `ANTHROPIC_API_KEY` | Your Anthropic API key (sk-ant-...) |
 | `REDDIT_MONITOR_CRON_SECRET` | A random string (same as `supabaseAuthToken` in config.js) |
-| `KEYWORDS` | Comma-separated keywords, e.g. `saas,bootstrapped,marketing,customer,churn` |
-| `SCORE_PROMPT` | Your scoring prompt (see config.js for template) |
-| `DRAFT_PROMPT` | Your draft prompt (see config.js for template) |
-| `DAILY_DRAFT_LIMIT` | `8` (or whatever you want) |
-| `MAX_PER_RUN` | `3` |
-| `MIN_SCORE` | `6` |
+
+That's it for Secrets. Keywords, prompts, and limits are all managed in `config.js` and sent to the edge function with each request.
 
 ### Step 5: Configure your settings
 
@@ -103,6 +99,9 @@ Edit `config.js`:
 4. **supabaseAuthToken** - Same random string you set as `REDDIT_MONITOR_CRON_SECRET`
 5. **scorePrompt** - Describe YOUR persona, expertise, and angles
 6. **draftPrompt** - Describe YOUR writing style and product mention rules
+7. **dailyDraftLimit** - Max drafts per day (default: 8)
+8. **maxPerRun** - Max drafts per run (default: 3)
+9. **minScore** - Minimum score to generate a draft (default: 6)
 
 ### Step 6: Test
 
@@ -122,7 +121,7 @@ Run every 3 hours while your laptop is open:
 which node
 
 # Set up cron (replace /usr/local/bin/node with your path)
-echo "0 8,11,14,17,20,23 * * * cd ~/reddit-monitor && /usr/local/bin/node scraper.js >> ~/reddit-monitor.log 2>&1" | crontab -
+echo "0 8,11,14,17,20,23 * * * cd ~/desktop/scraper/reddit-monitor && /usr/local/bin/node scraper.js >> ~/reddit-monitor.log 2>&1" | crontab -
 
 # Verify
 crontab -l
@@ -132,11 +131,11 @@ crontab -l
 1. Open Task Scheduler
 2. Create Basic Task → name it "Reddit Monitor"
 3. Trigger: Daily, repeat every 3 hours
-4. Action: Start a program → `node`, arguments: `scraper.js`, start in: `C:\path\to\reddit-monitor`
+4. Action: Start a program → `node`, arguments: `scraper.js`, start in: `C:\path\to\desktop\scraper\reddit-monitor`
 
 ## Customizing the AI
 
-The two most important things to customize are the **scoring prompt** and **draft prompt**.
+The two most important things to customize are the **scoring prompt** and **draft prompt** in `config.js`.
 
 ### Scoring prompt
 
@@ -173,8 +172,7 @@ No. It scrapes old.reddit.com without authentication from your residential IP.
 The cron job won't run. No posts are lost, you just don't get drafts for that period. It picks back up when you open your laptop.
 
 **Can I change subreddits/keywords without redeploying?**
-Subreddits and hours: edit `config.js` locally, no deploy needed.
-Keywords and prompts: update the env vars in Supabase dashboard, no deploy needed.
+Yes. Everything is in `config.js` locally. Edit and save, the next cron run picks it up. No Supabase redeploy needed.
 
 **What if Reddit blocks me?**
 Unlikely with residential IP and polite rate limiting (2-4 second delays). If it happens, the scraper logs 403 errors and skips that subreddit.
@@ -186,7 +184,7 @@ Each person needs their own Supabase project and config. The edge function code 
 
 ```
 reddit-monitor/
-├── config.js          ← YOUR settings (subreddits, prompts, etc)
+├── config.js          ← YOUR settings (subreddits, prompts, limits, etc)
 ├── scraper.js         ← Runs on your laptop (cron)
 ├── setup.sql          ← Database tables (run once)
 ├── package.json
