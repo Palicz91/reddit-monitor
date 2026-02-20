@@ -5,19 +5,11 @@ import { createClient } from 'jsr:@supabase/supabase-js@2';
 const TELEGRAM_BOT_TOKEN = Deno.env.get('REDDIT_MONITOR_TG_TOKEN')!;
 const TELEGRAM_CHAT_ID = Deno.env.get('REDDIT_MONITOR_TG_CHAT_ID')!;
 const ANTHROPIC_API_KEY = Deno.env.get('ANTHROPIC_API_KEY')!;
-const DAILY_DRAFT_LIMIT = parseInt(Deno.env.get('DAILY_DRAFT_LIMIT') || '8', 10);
-const MAX_PER_RUN = parseInt(Deno.env.get('MAX_PER_RUN') || '3', 10);
-const MIN_SCORE = parseInt(Deno.env.get('MIN_SCORE') || '6', 10);
 
 const supabase = createClient(
   Deno.env.get('SUPABASE_URL')!,
   Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
 );
-
-// Keywords and prompts come from env vars (set in Supabase dashboard)
-const KEYWORDS = (Deno.env.get('KEYWORDS') || '').split(',').map(k => k.trim()).filter(Boolean);
-const SCORE_SYSTEM_PROMPT = Deno.env.get('SCORE_PROMPT') || '';
-const DRAFT_SYSTEM_PROMPT = Deno.env.get('DRAFT_PROMPT') || '';
 
 interface RedditPost {
   title: string;
@@ -34,6 +26,29 @@ interface ScoreResult {
   score: number;
   angle: string;
   reason: string;
+}
+
+interface RunConfig {
+  keywords: string[];
+  scorePrompt: string;
+  draftPrompt: string;
+  dailyDraftLimit: number;
+  maxPerRun: number;
+  minScore: number;
+}
+
+function parseConfig(body: any): RunConfig {
+  return {
+    keywords: ((body.keywords || Deno.env.get('KEYWORDS') || '') as string)
+      .split(',')
+      .map((k: string) => k.trim())
+      .filter(Boolean),
+    scorePrompt: body.scorePrompt || Deno.env.get('SCORE_PROMPT') || '',
+    draftPrompt: body.draftPrompt || Deno.env.get('DRAFT_PROMPT') || '',
+    dailyDraftLimit: parseInt(body.dailyDraftLimit || Deno.env.get('DAILY_DRAFT_LIMIT') || '8', 10),
+    maxPerRun: parseInt(body.maxPerRun || Deno.env.get('MAX_PER_RUN') || '3', 10),
+    minScore: parseInt(body.minScore || Deno.env.get('MIN_SCORE') || '6', 10),
+  };
 }
 
 // ── Daily cap ──
@@ -96,7 +111,7 @@ function calculateBaseScore(post: RedditPost): number {
   return score;
 }
 
-async function scorePost(post: RedditPost): Promise<ScoreResult> {
+async function scorePost(post: RedditPost, scorePrompt: string): Promise<ScoreResult> {
   const baseScore = calculateBaseScore(post);
 
   if (baseScore <= 1) {
@@ -115,7 +130,7 @@ async function scorePost(post: RedditPost): Promise<ScoreResult> {
       body: JSON.stringify({
         model: 'claude-haiku-4-5-20251001',
         max_tokens: 100,
-        system: SCORE_SYSTEM_PROMPT,
+        system: scorePrompt,
         messages: [
           {
             role: 'user',
@@ -151,7 +166,7 @@ async function scorePost(post: RedditPost): Promise<ScoreResult> {
 
 // ── Drafting ──
 
-async function generateDraft(post: RedditPost): Promise<string> {
+async function generateDraft(post: RedditPost, draftPrompt: string): Promise<string> {
   try {
     const postContext = buildPostContext(post);
     const res = await fetch('https://api.anthropic.com/v1/messages', {
@@ -164,7 +179,7 @@ async function generateDraft(post: RedditPost): Promise<string> {
       body: JSON.stringify({
         model: 'claude-sonnet-4-5-20250929',
         max_tokens: 400,
-        system: DRAFT_SYSTEM_PROMPT,
+        system: draftPrompt,
         messages: [
           {
             role: 'user',
@@ -264,9 +279,9 @@ function splitMessage(text: string, maxLength: number): string[] {
   return chunks;
 }
 
-function isRelevant(post: RedditPost): boolean {
+function isRelevant(post: RedditPost, keywords: string[]): boolean {
   const text = `${post.title} ${post.selftext}`.toLowerCase();
-  return KEYWORDS.some((kw) => text.includes(kw.toLowerCase()));
+  return keywords.some((kw) => text.includes(kw.toLowerCase()));
 }
 
 // ── Main handler ──
@@ -285,36 +300,35 @@ Deno.serve(async (req) => {
   const noDraft = reqUrl.searchParams.get('nodraft') === '1';
 
   try {
-    let allPosts: RedditPost[] = [];
-
     // Cleanup seen posts older than 7 days
     await supabase
       .from('reddit_seen_posts')
       .delete()
       .lt('seen_at', new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString());
 
-    if (req.method === 'POST') {
-      const body = await req.json();
-      if (!body.posts || !Array.isArray(body.posts)) {
-        return new Response(
-          JSON.stringify({ error: 'POST body must have "posts" array' }),
-          { status: 400, headers: { 'Content-Type': 'application/json' } }
-        );
-      }
-      allPosts = body.posts;
-      console.log(`📥 Received ${allPosts.length} posts from ${body.source || 'unknown'}`);
-    } else {
+    if (req.method !== 'POST') {
       const draftsToday = await getDraftsToday();
       return new Response(
         JSON.stringify({
           status: 'ok',
           message: 'POST scraped posts to this endpoint. GET returns status only.',
           draftsToday,
-          slotsLeft: DAILY_DRAFT_LIMIT - draftsToday,
         }),
         { headers: { 'Content-Type': 'application/json' } }
       );
     }
+
+    const body = await req.json();
+    if (!body.posts || !Array.isArray(body.posts)) {
+      return new Response(
+        JSON.stringify({ error: 'POST body must have "posts" array' }),
+        { status: 400, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+
+    const config = parseConfig(body);
+    const allPosts: RedditPost[] = body.posts;
+    console.log(`📥 Received ${allPosts.length} posts from ${body.source || 'unknown'}`);
 
     const debugInfo: any = { totalReceived: allPosts.length };
 
@@ -329,12 +343,12 @@ Deno.serve(async (req) => {
 
     // Keyword filter
     const keywordMatched = unique
-      .filter((p) => isRelevant(p))
+      .filter((p) => isRelevant(p, config.keywords))
       .sort((a, b) => b.score - a.score)
       .slice(0, 15);
 
     // Filter already-seen posts
-    const seenKeys = keywordMatched.map(p => p.permalink || p.title).filter(Boolean);
+    const seenKeys = keywordMatched.map((p) => p.permalink || p.title).filter(Boolean);
     let seenSet = new Set<string>();
     if (seenKeys.length > 0) {
       const { data: seenRows } = await supabase
@@ -343,7 +357,7 @@ Deno.serve(async (req) => {
         .in('permalink', seenKeys);
       seenSet = new Set((seenRows || []).map((r: any) => r.permalink));
     }
-    const relevant = keywordMatched.filter(p => !seenSet.has(p.permalink || p.title));
+    const relevant = keywordMatched.filter((p) => !seenSet.has(p.permalink || p.title));
 
     debugInfo.uniquePosts = unique.length;
     debugInfo.keywordMatched = keywordMatched.length;
@@ -352,10 +366,12 @@ Deno.serve(async (req) => {
 
     // Daily cap
     const draftsToday = await getDraftsToday();
-    const slotsLeft = DAILY_DRAFT_LIMIT - draftsToday;
+    const slotsLeft = config.dailyDraftLimit - draftsToday;
 
     if (slotsLeft <= 0) {
-      await sendTelegram(`✅ Daily draft limit reached (${draftsToday}/${DAILY_DRAFT_LIMIT}). Resuming tomorrow.`);
+      await sendTelegram(
+        `✅ Daily draft limit reached (${draftsToday}/${config.dailyDraftLimit}). Resuming tomorrow.`
+      );
       return new Response(
         JSON.stringify({ success: true, reason: 'daily_limit_reached', draftsToday }),
         { headers: { 'Content-Type': 'application/json' } }
@@ -365,17 +381,19 @@ Deno.serve(async (req) => {
     // Score
     const scored: { post: RedditPost; result: ScoreResult }[] = [];
     for (const post of relevant) {
-      const result = await scorePost(post);
-      console.log(`Score: ${result.score}/10 | ${result.angle} | r/${post.subreddit} | ${post.title.slice(0, 60)}`);
+      const result = await scorePost(post, config.scorePrompt);
+      console.log(
+        `Score: ${result.score}/10 | ${result.angle} | r/${post.subreddit} | ${post.title.slice(0, 60)}`
+      );
       scored.push({ post, result });
       await new Promise((r) => setTimeout(r, 300));
     }
 
     // Qualify
     const qualified = scored
-      .filter(({ result }) => result.score >= MIN_SCORE && result.angle !== 'none')
+      .filter(({ result }) => result.score >= config.minScore && result.angle !== 'none')
       .sort((a, b) => b.result.score - a.result.score)
-      .slice(0, Math.min(MAX_PER_RUN, slotsLeft));
+      .slice(0, Math.min(config.maxPerRun, slotsLeft));
 
     debugInfo.qualifiedCount = qualified.length;
     debugInfo.slotsLeft = slotsLeft;
@@ -387,17 +405,19 @@ Deno.serve(async (req) => {
           .slice(0, 5)
           .map(({ post, result }) => `• ${result.score}/10: ${post.title.slice(0, 50)}`)
           .join('\n');
-        await sendTelegram(`📭 ${relevant.length} keyword matches, none scored ${MIN_SCORE}+.\n\nTop scores:\n${topScores}`);
+        await sendTelegram(
+          `📭 ${relevant.length} keyword matches, none scored ${config.minScore}+.\n\nTop scores:\n${topScores}`
+        );
       }
     } else {
-      const header = `🔔 <b>Reddit Monitor</b>\n${qualified.length} post${qualified.length > 1 ? 's' : ''} to comment on (${draftsToday}/${DAILY_DRAFT_LIMIT} used today)\n\n💡 Copy the draft, tweak it, post it.`;
+      const header = `🔔 <b>Reddit Monitor</b>\n${qualified.length} post${qualified.length > 1 ? 's' : ''} to comment on (${draftsToday}/${config.dailyDraftLimit} used today)\n\n💡 Copy the draft, tweak it, post it.`;
       await sendTelegram(header);
 
       let newDrafts = 0;
       for (const { post, result } of qualified) {
         let draft = '(draft disabled)';
         if (!noDraft && ANTHROPIC_API_KEY) {
-          draft = await generateDraft(post);
+          draft = await generateDraft(post, config.draftPrompt);
           newDrafts++;
           await new Promise((r) => setTimeout(r, 1000));
         }
