@@ -1,67 +1,60 @@
-const { chromium } = require('playwright');
 const config = require('./config');
 
-async function scrapeSubreddit(context, subreddit) {
-  const page = await context.newPage();
-  const url = `https://old.reddit.com/r/${subreddit}/new/`;
+// ============================================================
+// SCRAPER (JSON API - no Playwright needed)
+// ============================================================
+
+const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
+async function scrapeSubreddit(subreddit) {
+  const url = `https://old.reddit.com/r/${subreddit}/new.json?limit=25`;
 
   try {
-    const res = await page.goto(url, {
-      waitUntil: 'domcontentloaded',
-      timeout: 20000,
+    const res = await fetch(url, {
+      headers: { 'User-Agent': USER_AGENT },
     });
 
-    if (res.status() !== 200) {
-      console.log(`  ❌ r/${subreddit}: HTTP ${res.status()}`);
-      await page.close();
+    if (res.status !== 200) {
+      console.log(`  ❌ r/${subreddit}: HTTP ${res.status}`);
       return [];
     }
 
-    const posts = await page.$$eval('#siteTable .thing:not(.promoted)', els =>
-      els.map(el => {
-        const titleEl = el.querySelector('a.title');
-        const timeEl = el.querySelector('time');
-        const scoreEl = el.querySelector('.score.unvoted');
-        const commentsEl = el.querySelector('.comments');
-        const permalink = el.getAttribute('data-permalink') || '';
-        const subreddit = el.getAttribute('data-subreddit') || '';
-        const expandoEl = el.querySelector('.expando .usertext-body');
-        const selftext = expandoEl ? expandoEl.textContent.trim() : '';
-
+    const json = await res.json();
+    const posts = (json.data?.children || [])
+      .filter(child => child.kind === 't3')
+      .map(child => {
+        const d = child.data;
         return {
-          title: titleEl ? titleEl.textContent.trim() : '',
-          selftext,
-          url: titleEl ? titleEl.href : '',
-          permalink,
-          created_utc: timeEl ? new Date(timeEl.getAttribute('datetime')).getTime() / 1000 : 0,
-          subreddit,
-          num_comments: commentsEl ? parseInt(commentsEl.textContent) || 0 : 0,
-          score: scoreEl ? parseInt(scoreEl.textContent) || 0 : 0,
+          title: d.title || '',
+          selftext: d.selftext || '',
+          url: d.url || '',
+          permalink: d.permalink || '',
+          created_utc: d.created_utc || 0,
+          subreddit: d.subreddit || subreddit,
+          num_comments: d.num_comments || 0,
+          score: d.score || 0,
         };
-      })
-    );
+      });
 
-    console.log(`  ✅ r/${subreddit}: ${posts.length} posts`);
-    await page.close();
+    const withBody = posts.filter(p => p.selftext.length > 0).length;
+    console.log(`  ✅ r/${subreddit}: ${posts.length} posts (${withBody} with body)`);
     return posts;
   } catch (err) {
     console.log(`  ❌ r/${subreddit}: ${err.message}`);
-    await page.close();
     return [];
   }
 }
+
+// ============================================================
+// MAIN
+// ============================================================
 
 (async () => {
   const startTime = Date.now();
   console.log(`\n🚀 Reddit Scraper - ${new Date().toISOString()}`);
   console.log(`📋 ${config.subreddits.length} subreddits, last ${config.hoursAgo}h\n`);
 
-  const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext({
-    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-  });
-
-  // Check daily limit before scraping
+  // Step 0: Check daily limit before scraping
   try {
     const baseUrl = config.supabaseUrl.split('?')[0];
     const checkRes = await fetch(baseUrl, {
@@ -70,7 +63,6 @@ async function scrapeSubreddit(context, subreddit) {
     const status = await checkRes.json();
     if (status.slotsLeft <= 0) {
       console.log(`⏸️ Daily limit reached (${status.draftsToday}). Skipping.`);
-      await browser.close();
       return;
     }
     console.log(`📊 ${status.slotsLeft} slots left today\n`);
@@ -78,20 +70,21 @@ async function scrapeSubreddit(context, subreddit) {
     console.log('⚠️ Could not check daily limit, proceeding anyway\n');
   }
 
-  // Scrape
+  // Step 1: Scrape all subreddits
   let allPosts = [];
   for (const sub of config.subreddits) {
-    const posts = await scrapeSubreddit(context, sub);
+    const posts = await scrapeSubreddit(sub);
     allPosts.push(...posts);
+
+    // Polite delay between subreddits
     await new Promise(r => setTimeout(r, 2000 + Math.random() * 2000));
   }
-  await browser.close();
 
-  // Filter recent
+  // Step 2: Filter recent posts
   const cutoff = Date.now() / 1000 - config.hoursAgo * 3600;
   const recentPosts = allPosts.filter(p => p.created_utc > cutoff);
 
-  // Dedup
+  // Step 3: Deduplicate
   const seen = new Set();
   const uniquePosts = recentPosts.filter(p => {
     const key = p.permalink || p.title;
@@ -100,10 +93,11 @@ async function scrapeSubreddit(context, subreddit) {
     return true;
   });
 
+  const withBody = uniquePosts.filter(p => p.selftext.length > 0).length;
   console.log(`\n📊 Summary:`);
   console.log(`   Total scraped: ${allPosts.length}`);
   console.log(`   Recent (${config.hoursAgo}h): ${recentPosts.length}`);
-  console.log(`   Unique: ${uniquePosts.length}`);
+  console.log(`   Unique: ${uniquePosts.length} (${withBody} with body)`);
   console.log(`   Duration: ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
 
   if (uniquePosts.length === 0) {
@@ -111,7 +105,7 @@ async function scrapeSubreddit(context, subreddit) {
     return;
   }
 
-  // Send to Supabase
+  // Step 4: Send to Supabase with config
   console.log(`\n📤 Sending ${uniquePosts.length} posts to Supabase...`);
   try {
     const res = await fetch(config.supabaseUrl, {
@@ -120,7 +114,16 @@ async function scrapeSubreddit(context, subreddit) {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${config.supabaseAuthToken}`,
       },
-      body: JSON.stringify({ source: 'playwright-scraper', posts: uniquePosts }),
+      body: JSON.stringify({
+        source: 'json-scraper',
+        posts: uniquePosts,
+        keywords: config.keywords,
+        scorePrompt: config.scorePrompt,
+        draftPrompt: config.draftPrompt,
+        dailyDraftLimit: config.dailyDraftLimit,
+        maxPerRun: config.maxPerRun,
+        minScore: config.minScore,
+      }),
     });
     const data = await res.json();
     console.log(`📬 Response:`, JSON.stringify(data, null, 2));
