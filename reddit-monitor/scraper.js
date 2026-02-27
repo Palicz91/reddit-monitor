@@ -36,7 +36,7 @@ async function scrapeSubreddit(subreddit) {
         };
       });
 
-    const withBody = posts.filter(p => p.selftext.length > 0).length;
+    const withBody = posts.filter(p => p.selftext.trim().length > 0).length;
     console.log(`  ✅ r/${subreddit}: ${posts.length} posts (${withBody} with body)`);
     return posts;
   } catch (err) {
@@ -93,20 +93,25 @@ async function scrapeSubreddit(subreddit) {
     return true;
   });
 
-  const withBody = uniquePosts.filter(p => p.selftext.length > 0).length;
+  // Step 4: Filter out posts without body text
+  const postsWithBody = uniquePosts.filter(p => p.selftext.trim().length > 0);
+  const skipped = uniquePosts.length - postsWithBody.length;
+
   console.log(`\n📊 Summary:`);
   console.log(`   Total scraped: ${allPosts.length}`);
   console.log(`   Recent (${config.hoursAgo}h): ${recentPosts.length}`);
-  console.log(`   Unique: ${uniquePosts.length} (${withBody} with body)`);
+  console.log(`   Unique: ${uniquePosts.length}`);
+  console.log(`   Skipped (no body): ${skipped}`);
+  console.log(`   Sending to score: ${postsWithBody.length}`);
   console.log(`   Duration: ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
 
-  if (uniquePosts.length === 0) {
-    console.log('\n📭 No recent posts to send.');
+  if (postsWithBody.length === 0) {
+    console.log('\n📭 No recent posts with body text to send.');
     return;
   }
 
-  // Step 4: Send to Supabase with config
-  console.log(`\n📤 Sending ${uniquePosts.length} posts to Supabase...`);
+  // Step 5: Send to Supabase with config
+  console.log(`\n📤 Sending ${postsWithBody.length} posts to Supabase...`);
   try {
     const res = await fetch(config.supabaseUrl, {
       method: 'POST',
@@ -116,7 +121,7 @@ async function scrapeSubreddit(subreddit) {
       },
       body: JSON.stringify({
         source: 'json-scraper',
-        posts: uniquePosts,
+        posts: postsWithBody,
         keywords: config.keywords,
         scorePrompt: config.scorePrompt,
         draftPrompt: config.draftPrompt,
