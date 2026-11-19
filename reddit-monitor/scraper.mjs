@@ -19,7 +19,7 @@
 //
 // Config: .env next to this file (see .env.example). Node 18+, no dependencies.
 
-import { readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -47,10 +47,35 @@ export function toResponse(r) {
 
 /**
  * Opens Chrome with the monitor's own profile and returns a fetch that runs inside a
- * reddit.com tab, so Reddit sees a normal logged-in browser. `visible` shows the window
- * (login); otherwise Chrome runs headless. CHROME_PATH / PROFILE_DIR override the defaults.
+ * reddit.com tab, so Reddit sees a normal logged-in browser. Modes: 'visible' (login window),
+ * 'headless' (no window), 'window' (a real window parked off-screen and minimized, for when
+ * Reddit refuses headless Chrome). CHROME_PATH / PROFILE_DIR override the defaults.
  */
-export async function openBrowser(env, { visible = false } = {}) {
+export const BROWSER_MODES = ['headless', 'window'];
+
+const profileDir = (env) => env.PROFILE_DIR || DEFAULT_PROFILE_DIR;
+const modeFile = (env) => join(profileDir(env), '..', 'browser-mode.txt');
+
+/** The mode `check` last found working (headless when nothing is saved yet). */
+export function savedMode(env) {
+  try {
+    const m = readFileSync(modeFile(env), 'utf8').trim();
+    return BROWSER_MODES.includes(m) ? m : 'headless';
+  } catch {
+    return 'headless';
+  }
+}
+
+function saveMode(env, mode) {
+  try {
+    mkdirSync(dirname(modeFile(env)), { recursive: true });
+    writeFileSync(modeFile(env), `${mode}\n`);
+  } catch {
+    /* next run falls back to headless */
+  }
+}
+
+export async function openBrowser(env, { mode = 'headless' } = {}) {
   let chromium;
   try {
     ({ chromium } = await import('playwright-core'));
@@ -58,7 +83,7 @@ export async function openBrowser(env, { visible = false } = {}) {
     throw new Error('browser helper missing: run ./install-mac.sh once (it runs npm install)');
   }
   const opts = {
-    headless: !visible && env.BROWSER_HEADLESS !== '0',
+    headless: mode === 'headless',
     args: ['--disable-blink-features=AutomationControlled'],
     ignoreDefaultArgs: ['--enable-automation'],
     viewport: { width: 1280, height: 900 },
@@ -66,9 +91,11 @@ export async function openBrowser(env, { visible = false } = {}) {
   if (env.CHROME_PATH) opts.executablePath = env.CHROME_PATH;
   else opts.channel = 'chrome';
   if (opts.headless) opts.userAgent = USER_AGENT; // headless Chrome says "HeadlessChrome" otherwise
+  if (mode === 'window') opts.args.push('--window-position=-3000,-3000', '--window-size=1280,900');
   let context;
   try {
-    context = await chromium.launchPersistentContext(env.PROFILE_DIR || DEFAULT_PROFILE_DIR, opts);
+    mkdirSync(profileDir(env), { recursive: true });
+    context = await chromium.launchPersistentContext(profileDir(env), opts);
   } catch (err) {
     const msg = String(err.message || err);
     if (/ProcessSingleton|SingletonLock|already in use/i.test(msg)) {
@@ -80,6 +107,15 @@ export async function openBrowser(env, { visible = false } = {}) {
     throw err;
   }
   const page = context.pages()[0] || (await context.newPage());
+  if (mode === 'window') {
+    try {
+      const cdp = await context.newCDPSession(page);
+      const { windowId } = await cdp.send('Browser.getWindowForTarget');
+      await cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'minimized' } });
+    } catch {
+      /* off-screen position is enough */
+    }
+  }
   const fetchImpl = async (url) => {
     if (!page.url().startsWith('https://www.reddit.com')) {
       await page.goto('https://www.reddit.com/', { waitUntil: 'domcontentloaded', timeout: 45_000 }).catch(() => {});
@@ -94,7 +130,21 @@ export async function openBrowser(env, { visible = false } = {}) {
     }, url);
     return toResponse(r);
   };
-  return { context, page, fetchImpl, close: () => context.close().catch(() => {}) };
+  /** Reddit username of the profile's login, or null when logged out / unknown. */
+  const whoAmI = async () => {
+    try {
+      await fetchImpl('https://www.reddit.com/api/me.json'); // makes sure the tab is on reddit.com
+      return await page.evaluate(async () => {
+        const r = await fetch('/api/me.json', { credentials: 'include' });
+        if (!r.ok) return null;
+        const j = await r.json().catch(() => null);
+        return j?.data?.name || j?.name || null;
+      });
+    } catch {
+      return null;
+    }
+  };
+  return { context, page, fetchImpl, whoAmI, close: () => context.close().catch(() => {}) };
 }
 
 // Used only when the backend GET fails, so a backend hiccup still yields a useful run.
@@ -242,34 +292,71 @@ async function getSettings(endpoint, secret) {
 
 const LOGIN_HINT = 'Reddit wants a login: run ./install-mac.sh login and log in in the Chrome window.';
 
+const TEST_URL = 'https://www.reddit.com/r/GoogleMyBusiness/new.json?limit=5&raw_json=1';
+
+/** One test request in an open browser; returns { ok, status, count, user, loginWall }. */
+async function probe(b) {
+  const health = { requests: 1, ok: 0, failed: 0, statuses: {}, errors: [] };
+  const user = await b.whoAmI();
+  const children = await fetchListing(TEST_URL, health, b.fetchImpl);
+  return { ok: health.ok > 0, status: health.lastStatus ?? 'none', count: children.length, user, loginWall: !!health.loginWall, errors: health.errors };
+}
+
+const who = (u) => (u ? `logged in as u/${u}` : 'NOT logged in');
+
 /** `node scraper.mjs login`: visible Chrome on the monitor profile; you log in, press Enter. */
 async function login(env) {
-  const b = await openBrowser(env, { visible: true });
+  const b = await openBrowser(env, { mode: 'visible' });
   await b.page.goto('https://www.reddit.com/login/', { waitUntil: 'domcontentloaded' }).catch(() => {});
   console.log('👉 Log in to Reddit in the Chrome window that just opened (a spare account is fine).');
-  console.log('   When you see your Reddit home page, come back here and press Enter.');
+  console.log('   When you see your Reddit home page (your avatar top right), come back here and press Enter.');
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   await new Promise((r) => rl.question('', () => r()));
   rl.close();
-  await b.close();
-  await check(env);
-}
-
-/** `node scraper.mjs check`: one Reddit request through Chrome; says whether reading works. No backend call. */
-async function check(env) {
-  const b = await openBrowser(env);
-  const health = { requests: 1, ok: 0, failed: 0, statuses: {}, errors: [] };
-  let children = [];
+  let p;
   try {
-    children = await fetchListing('https://www.reddit.com/r/GoogleMyBusiness/new.json?limit=5&raw_json=1', health, b.fetchImpl);
+    p = await probe(b);
   } finally {
     await b.close();
   }
-  if (health.ok) {
-    console.log(`✅ Reddit OK (HTTP ${health.lastStatus}, ${children.length} posts read).`);
+  console.log(`   In the login window: ${who(p.user)}, Reddit answered HTTP ${p.status}${p.ok ? ` (${p.count} posts)` : ''}.`);
+  if (!p.user) {
+    console.log('❌ The login did not stick. Run ./install-mac.sh login again and log in before pressing Enter.');
+    process.exitCode = 1;
     return;
   }
-  console.log(`❌ Reddit refused (HTTP ${health.lastStatus ?? 'none'}). ${health.loginWall ? LOGIN_HINT : health.errors.join('; ')}`);
+  await check(env);
+}
+
+/**
+ * `node scraper.mjs check`: tries the background modes (headless, then a hidden window) and
+ * remembers the first one Reddit accepts, so scheduled runs use it. No backend call.
+ */
+async function check(env) {
+  for (const mode of BROWSER_MODES) {
+    let b;
+    try {
+      b = await openBrowser(env, { mode });
+    } catch (err) {
+      console.log(`❌ ${err.message}`);
+      process.exitCode = 1;
+      return;
+    }
+    let p;
+    try {
+      p = await probe(b);
+    } finally {
+      await b.close();
+    }
+    const label = mode === 'headless' ? 'background (no window)' : 'background (hidden window)';
+    if (p.ok) {
+      saveMode(env, mode);
+      console.log(`✅ Reddit OK in ${label} mode: ${who(p.user)}, ${p.count} posts read. Scheduled runs will use this mode.`);
+      return;
+    }
+    console.log(`   ${label}: Reddit refused (HTTP ${p.status}), ${who(p.user)}.`);
+  }
+  console.log(`❌ Reddit refused every mode. ${LOGIN_HINT}`);
   process.exitCode = 1;
 }
 
@@ -295,7 +382,7 @@ async function main() {
   let posts = [];
   let browser;
   try {
-    browser = await openBrowser(env);
+    browser = await openBrowser(env, { mode: savedMode(env) });
   } catch (err) {
     // Still report to the backend: ok = 0 makes it send the "blocked" Telegram alert.
     console.log(`❌ ${err.message}`);

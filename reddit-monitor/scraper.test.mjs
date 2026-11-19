@@ -123,3 +123,14 @@ test('toResponse exposes headers case-insensitively and the 429 path retries onc
   assert.equal(r.headers.get('X-Ratelimit-Reset'), '1');
   assert.equal(r.headers.get('missing'), null);
 });
+
+test('savedMode falls back to headless and ignores unknown values', async () => {
+  const { savedMode } = await import('./scraper.mjs');
+  const dir = mkdtempSync(join(tmpdir(), 'rm-mode-'));
+  const env = { PROFILE_DIR: join(dir, 'chrome-profile') };
+  assert.equal(savedMode(env), 'headless');
+  writeFileSync(join(dir, 'browser-mode.txt'), 'window\n');
+  assert.equal(savedMode(env), 'window');
+  writeFileSync(join(dir, 'browser-mode.txt'), 'rm -rf\n');
+  assert.equal(savedMode(env), 'headless');
+});
