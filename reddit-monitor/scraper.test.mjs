@@ -11,9 +11,9 @@ import {
   fromItem,
   loadEnv,
   loadPage,
-  loadSent,
+  loadTexts,
   pickForBody,
-  pruneSent,
+  pruneTexts,
   savedMode,
   toPermalink,
   unreadable,
@@ -95,7 +95,7 @@ test('toPermalink accepts relative and reddit absolute links only', () => {
 });
 
 test('unreadable counts items without link or date', () => {
-  assert.equal(unreadable([item(), item({ createdMs: 0 }), item({ permalink: '' })]), 2);
+  assert.equal(unreadable([item(), item({ createdMs: 0 }), item({ permalink: '' })]).length, 2);
 });
 
 test('dedupe keeps the first copy by permalink', () => {
@@ -139,13 +139,18 @@ test('savedMode falls back to headless and ignores unknown values', () => {
   assert.equal(savedMode(env), 'headless');
 });
 
-test('sent list: bad file reads as empty, old entries are pruned', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'rm-sent-'));
+test('text cache: bad file reads as empty, old or malformed entries are pruned', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'rm-texts-'));
   const env = { PROFILE_DIR: join(dir, 'chrome-profile') };
-  assert.deepEqual(loadSent(env), {});
-  writeFileSync(join(dir, 'sent.json'), '[1,2]');
-  assert.deepEqual(loadSent(env), {});
-  assert.deepEqual(pruneSent({ a: now - 3600, b: now - 200 * 3600, c: 'x' }, now), { a: now - 3600 });
+  assert.deepEqual(loadTexts(env), {});
+  writeFileSync(join(dir, 'texts.json'), '[1,2]');
+  assert.deepEqual(loadTexts(env), {});
+  writeFileSync(join(dir, 'texts.json'), JSON.stringify({ a: { t: now - 3600, s: 'body' } }));
+  assert.equal(loadTexts(env).a.s, 'body');
+  assert.deepEqual(
+    pruneTexts({ a: { t: now - 3600, s: '' }, b: { t: now - 200 * 3600, s: 'x' }, c: 5, d: { t: now } }, now),
+    { a: { t: now - 3600, s: '' } }
+  );
 });
 
 // ---------- browser: old-Reddit-shaped pages served locally (needs CHROME_PATH) ----------

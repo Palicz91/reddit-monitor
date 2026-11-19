@@ -12,13 +12,16 @@
 //   1. GET the backend for this run's settings (search queries, subreddits, lookback).
 //   2. Load one old-Reddit search page per query (newest first, past week) and the /new page of
 //      each subreddit group; read the posts from the page.
-//   3. Drop posts that can't take a comment (locked, archived, removed, stickied, NSFW, ads),
-//      posts older than the lookback window and posts already sent in an earlier run.
-//   4. Open new posts that may be about reviews to read their text (capped per run).
+//   3. Drop posts that can't take a comment (locked, archived, removed, stickied, NSFW, ads) and
+//      posts older than the lookback window.
+//   4. Open posts that may be about reviews to read their text (capped per run; texts read in an
+//      earlier run come from texts.json, so a post is opened once).
 //   5. POST them to the backend with a health block (page loads, HTTP statuses), so a blocked run
 //      is reported as blocked, not as a quiet day.
 //
-// The backend (ReviewTactic edge function `reddit-monitor`) keeps the seen-list, picks the
+// Every run sends every recent post: the backend (ReviewTactic edge function `reddit-monitor`)
+// scores at most 25 per run and leaves the rest for the next run, so it, not this file, keeps the
+// seen-list. It also picks the
 // removal-intent posts, scores, drafts and sends Telegram. Nothing here needs editing when
 // queries or prompts change.
 //
@@ -44,7 +47,7 @@ export const MAX_BODY_FETCH = 20;
 /** Subreddit posts whose title matches this get their text read; search hits always do. */
 export const REVIEWISH_RE =
   /review|google|yelp|rating|stars?\b|reput|defam|fake|trustpilot|tripadvisor|listing|\bgmb\b|\bgbp\b|maps/i;
-const SENT_KEEP_HOURS = 96;
+const TEXT_KEEP_HOURS = 96;
 
 // Used only when the backend GET fails, so a backend hiccup still yields a useful run.
 export const FALLBACK_SETTINGS = {
@@ -107,19 +110,21 @@ function writeState(env, name, text) {
   }
 }
 
-/** Permalinks already delivered to the backend: { permalink: unix seconds }. */
-export function loadSent(env) {
+/** Post texts read in earlier runs: { permalink: { t: unix seconds read, s: text } }. */
+export function loadTexts(env) {
   try {
-    const j = JSON.parse(readFileSync(stateFile(env, 'sent.json'), 'utf8'));
+    const j = JSON.parse(readFileSync(stateFile(env, 'texts.json'), 'utf8'));
     return j && typeof j === 'object' && !Array.isArray(j) ? j : {};
   } catch {
     return {};
   }
 }
 
-export function pruneSent(sent, nowS = Date.now() / 1000) {
+export function pruneTexts(texts, nowS = Date.now() / 1000) {
   const out = {};
-  for (const [k, t] of Object.entries(sent)) if (typeof t === 'number' && nowS - t < SENT_KEEP_HOURS * 3600) out[k] = t;
+  for (const [k, v] of Object.entries(texts)) {
+    if (v && typeof v.t === 'number' && typeof v.s === 'string' && nowS - v.t < TEXT_KEEP_HOURS * 3600) out[k] = v;
+  }
   return out;
 }
 
@@ -294,7 +299,7 @@ export function fromItem(it, cutoffUtc) {
 }
 
 /** Items the page had but that lack a link or date: a sign Reddit changed its markup. */
-export const unreadable = (items) => items.filter((it) => !toPermalink(it.permalink) || !it.createdMs).length;
+export const unreadable = (items) => items.filter((it) => !toPermalink(it.permalink) || !it.createdMs);
 
 export function dedupe(posts) {
   const seen = new Set();
@@ -462,10 +467,10 @@ async function run(env) {
   const cutoffUtc = Date.now() / 1000 - lookbackHours * 3600;
   const pages = buildPages(settings);
   const health = { requests: 0, ok: 0, failed: 0, statuses: {}, errors: [], settingsFromBackend: fromBackend };
-  const sent = pruneSent(loadSent(env));
+  const texts = pruneTexts(loadTexts(env));
   let posts = [];
   const fromSearch = new Set();
-  let badItems = 0;
+  const badItems = [];
 
   let browser = null;
   try {
@@ -483,16 +488,16 @@ async function run(env) {
         health.requests++;
         const data = await loadPage(browser.page, pg.url, health);
         const items = data ? data.items : [];
-        badItems += unreadable(items);
+        badItems.push(...unreadable(items));
         const kept = items.map((it) => fromItem(it, cutoffUtc)).filter(Boolean);
-        const fresh = kept.filter((p) => !sent[p.permalink]);
-        if (pg.search) for (const p of fresh) fromSearch.add(p.permalink);
-        console.log(`  HTTP ${health.lastStatus ?? '-'} ${short(pg.url)} → ${items.length} items, ${kept.length} recent, ${fresh.length} new`);
-        posts.push(...fresh);
+        for (const p of kept) if (!p.selftext && texts[p.permalink]) p.selftext = texts[p.permalink].s;
+        if (pg.search) for (const p of kept) fromSearch.add(p.permalink);
+        console.log(`  HTTP ${health.lastStatus ?? '-'} ${short(pg.url)} → ${items.length} items, ${kept.length} recent`);
+        posts.push(...kept);
         if (i < pages.length - 1) await gap();
       }
       posts = dedupe(posts);
-      const toRead = pickForBody(posts, fromSearch);
+      const toRead = pickForBody(posts.filter((p) => !texts[p.permalink]), fromSearch);
       if (toRead.length) console.log(`  reading the text of ${toRead.length} posts`);
       for (const p of toRead) {
         await gap();
@@ -505,19 +510,22 @@ async function run(env) {
           posts = posts.filter((x) => x.permalink !== p.permalink); // locked/removed since the listing
           continue;
         }
+        texts[p.permalink] = { t: Math.round(Date.now() / 1000), s: full.selftext };
         if (full.selftext) p.selftext = full.selftext;
         if (full.link_flair_text && !p.link_flair_text) p.link_flair_text = full.link_flair_text;
       }
     } finally {
       await browser.close();
+      writeState(env, 'texts.json', JSON.stringify(texts));
     }
   }
-  if (badItems) {
-    health.errors.push(`parse: ${badItems} posts without a link or date (Reddit page layout changed?)`);
-    console.log(`⚠️ ${badItems} posts had no link or date: Reddit may have changed its page layout.`);
+  if (badItems.length) {
+    const eg = `${badItems[0].kind} "${String(badItems[0].title).slice(0, 40)}" link=${String(badItems[0].permalink).slice(0, 60) || '-'} date=${badItems[0].createdMs || '-'}`;
+    health.errors.push(`parse: ${badItems.length} posts without a link or date, e.g. ${eg}`.slice(0, 200));
+    console.log(`⚠️ ${badItems.length} posts had no link or date (e.g. ${eg}).`);
   }
   health.durationS = Math.round((Date.now() - started) / 1000);
-  console.log(`📊 ${health.ok}/${health.requests} pages ok, ${posts.length} new posts in the last ${lookbackHours}h`);
+  console.log(`📊 ${health.ok}/${health.requests} pages ok, ${posts.length} posts in the last ${lookbackHours}h`);
   if (health.loginWall) console.log(`❌ ${LOGIN_HINT}`);
 
   let res;
@@ -534,9 +542,6 @@ async function run(env) {
   const text = await res.text();
   console.log(`📬 ${res.status} ${text.slice(0, 1500)}`);
   if (!res.ok) process.exit(1);
-  const nowS = Math.round(Date.now() / 1000);
-  for (const p of posts) sent[p.permalink] = nowS;
-  writeState(env, 'sent.json', JSON.stringify(sent));
   console.log(`✅ done in ${((Date.now() - started) / 1000).toFixed(1)}s`);
 }
 

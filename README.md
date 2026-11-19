@@ -19,9 +19,9 @@ backend. This repo holds no prompts and no secrets.
 2. Loads old Reddit pages in Chrome (headless): one Reddit-wide search per phrase (newest first,
    past week), plus the newest posts of a few subreddit groups. About 12 pages, ~6 s apart.
    A 429 waits 30 s once and retries.
-3. Skips posts that can't take a comment (locked, archived, removed, stickied, NSFW, ads), posts
-   older than the window and posts sent in an earlier run (`sent.json` next to the profile, 4 days).
-   Then opens up to 20 new posts that may be about reviews to read their text.
+3. Skips posts that can't take a comment (locked, archived, removed, stickied, NSFW, ads) and
+   posts older than the window. Then opens up to 20 posts that may be about reviews to read their
+   text; texts already read come from `texts.json` next to the profile (kept 4 days).
 4. Sends the posts and a health block (page count, HTTP statuses) to the backend.
    If Reddit blocked every request, the backend sends one Telegram alert (at most every 12 h)
    instead of treating it as a quiet day.
