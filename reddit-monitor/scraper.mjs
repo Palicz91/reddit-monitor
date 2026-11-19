@@ -1,23 +1,28 @@
 #!/usr/bin/env node
-// Reddit monitor, laptop side. Runs from launchd on a Mac. Since Nov 2026 Reddit blocks
-// every logged-out read ("blocked by network security") and every non-browser client
-// (curl and Node fetch still got 403 with a login cookie), from home connections too.
-// So requests go through the Mac's real Google Chrome (playwright-core, no bundled browser)
-// with its own profile that you log into once: `./install-mac.sh login`.
+// Reddit monitor, laptop side. Runs from launchd on a Mac.
+//
+// Why a real browser and HTML pages (2026-11-19): Reddit blocks every logged-out read and every
+// non-browser client ("blocked by network security"), from home connections too, and refuses the
+// .json listings even to a logged-in Chrome. Normal old.reddit.com pages still load for a
+// logged-in Chrome, headless included. So this drives the Mac's installed Google Chrome
+// (playwright-core, no bundled browser) on its own profile that you log into once
+// (`./install-mac.sh login`), and reads old Reddit's search and subreddit pages.
 //
 // One run:
 //   1. GET the backend for this run's settings (search queries, subreddits, lookback).
-//   2. Fetch Reddit JSON: one Reddit-wide search per query + /new of each subreddit group.
-//   3. Drop posts that can't take a comment (locked, archived, removed, stickied, NSFW)
-//      and posts older than the lookback window.
-//   4. POST everything to the backend with a health block (request counts, HTTP statuses),
-//      so a blocked run is reported as blocked, not as a quiet day.
+//   2. Load one old-Reddit search page per query (newest first, past week) and the /new page of
+//      each subreddit group; read the posts from the page.
+//   3. Drop posts that can't take a comment (locked, archived, removed, stickied, NSFW, ads),
+//      posts older than the lookback window and posts already sent in an earlier run.
+//   4. Open new posts that may be about reviews to read their text (capped per run).
+//   5. POST them to the backend with a health block (page loads, HTTP statuses), so a blocked run
+//      is reported as blocked, not as a quiet day.
 //
 // The backend (ReviewTactic edge function `reddit-monitor`) keeps the seen-list, picks the
 // removal-intent posts, scores, drafts and sends Telegram. Nothing here needs editing when
 // queries or prompts change.
 //
-// Config: .env next to this file (see .env.example). Node 18+, no dependencies.
+// Config: .env next to this file (see .env.example). Node 18+.
 
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -27,54 +32,104 @@ import { fileURLToPath } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
-// Same browser UA the old scraper used from this laptop without being blocked.
 const USER_AGENT =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
-/** Reddit's block pages for logged-out or rejected-login requests (two wordings seen, Nov 2026). */
-export const LOGIN_WALL_RE = /blocked by network security|blocked due to a network policy|try logging in/i;
-
+export const OLD = 'https://old.reddit.com';
 const DEFAULT_PROFILE_DIR = join(homedir(), 'Library', 'Application Support', 'reddit-monitor', 'chrome-profile');
+const REQUEST_GAP_MS = 5500; // + 0-1.5 s jitter between page loads
+const BODY_MAX_CHARS = 4000;
+/** Post pages opened per run to read the text; the rest go title-only. */
+export const MAX_BODY_FETCH = 20;
+/** Subreddit posts whose title matches this get their text read; search hits always do. */
+export const REVIEWISH_RE =
+  /review|google|yelp|rating|stars?\b|reput|defam|fake|trustpilot|tripadvisor|listing|\bgmb\b|\bgbp\b|maps/i;
+const SENT_KEEP_HOURS = 96;
 
-/** Wraps a page-context fetch result in the small Response shape fetchListing reads. */
-export function toResponse(r) {
-  return {
-    status: r.status,
-    headers: { get: (k) => (r.headers || {})[String(k).toLowerCase()] ?? null },
-    text: async () => r.text,
-  };
+// Used only when the backend GET fails, so a backend hiccup still yields a useful run.
+export const FALLBACK_SETTINGS = {
+  searchQueries: [
+    '"remove google review"',
+    '"fake google review"',
+    '"fake review" google business',
+    '"negative review" removed',
+    '"bad review" google remove',
+    '"review bombed"',
+  ],
+  subredditGroups: [['GoogleMyBusiness', 'LocalSEO', 'smallbusiness', 'restaurateur', 'sweatystartup']],
+  lookbackHours: 36,
+};
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const gap = () => sleep(REQUEST_GAP_MS + Math.random() * 1500);
+const short = (url) => url.replace(OLD, '').slice(0, 84);
+
+export function loadEnv(path) {
+  const env = {};
+  let text = '';
+  try {
+    text = readFileSync(path, 'utf8');
+  } catch {
+    return env;
+  }
+  for (const raw of text.split('\n')) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const m = line.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+    if (!m) continue;
+    env[m[1]] = m[2].replace(/^(['"])(.*)\1$/, '$2');
+  }
+  return env;
 }
 
-/**
- * Opens Chrome with the monitor's own profile and returns a fetch that runs inside a
- * reddit.com tab, so Reddit sees a normal logged-in browser. Modes: 'visible' (login window),
- * 'headless' (no window), 'window' (a real window parked off-screen and minimized, for when
- * Reddit refuses headless Chrome). CHROME_PATH / PROFILE_DIR override the defaults.
- */
-export const BROWSER_MODES = ['headless', 'window'];
+// ---------- state next to the Chrome profile ----------
 
+export const BROWSER_MODES = ['headless', 'window'];
 const profileDir = (env) => env.PROFILE_DIR || DEFAULT_PROFILE_DIR;
-const modeFile = (env) => join(profileDir(env), '..', 'browser-mode.txt');
+const stateFile = (env, name) => join(profileDir(env), '..', name);
 
 /** The mode `check` last found working (headless when nothing is saved yet). */
 export function savedMode(env) {
   try {
-    const m = readFileSync(modeFile(env), 'utf8').trim();
+    const m = readFileSync(stateFile(env, 'browser-mode.txt'), 'utf8').trim();
     return BROWSER_MODES.includes(m) ? m : 'headless';
   } catch {
     return 'headless';
   }
 }
 
-function saveMode(env, mode) {
+function writeState(env, name, text) {
   try {
-    mkdirSync(dirname(modeFile(env)), { recursive: true });
-    writeFileSync(modeFile(env), `${mode}\n`);
+    mkdirSync(dirname(stateFile(env, name)), { recursive: true });
+    writeFileSync(stateFile(env, name), text);
   } catch {
-    /* next run falls back to headless */
+    /* best effort */
   }
 }
 
+/** Permalinks already delivered to the backend: { permalink: unix seconds }. */
+export function loadSent(env) {
+  try {
+    const j = JSON.parse(readFileSync(stateFile(env, 'sent.json'), 'utf8'));
+    return j && typeof j === 'object' && !Array.isArray(j) ? j : {};
+  } catch {
+    return {};
+  }
+}
+
+export function pruneSent(sent, nowS = Date.now() / 1000) {
+  const out = {};
+  for (const [k, t] of Object.entries(sent)) if (typeof t === 'number' && nowS - t < SENT_KEEP_HOURS * 3600) out[k] = t;
+  return out;
+}
+
+// ---------- browser ----------
+
+/**
+ * Opens Chrome with the monitor's own profile. Modes: 'visible' (login window), 'headless'
+ * (no window), 'window' (a real window parked off-screen and minimized, if Reddit ever refuses
+ * headless). CHROME_PATH / PROFILE_DIR override the defaults.
+ */
 export async function openBrowser(env, { mode = 'headless' } = {}) {
   let chromium;
   try {
@@ -116,97 +171,130 @@ export async function openBrowser(env, { mode = 'headless' } = {}) {
       /* off-screen position is enough */
     }
   }
-  const fetchImpl = async (url) => {
-    if (!page.url().startsWith('https://www.reddit.com')) {
-      await page.goto('https://www.reddit.com/', { waitUntil: 'domcontentloaded', timeout: 45_000 }).catch(() => {});
-    }
-    const r = await page.evaluate(async (u) => {
-      const res = await fetch(u, { credentials: 'include', headers: { Accept: 'application/json' } });
-      return {
-        status: res.status,
-        headers: { 'x-ratelimit-reset': res.headers.get('x-ratelimit-reset') },
-        text: await res.text(),
-      };
-    }, url);
-    return toResponse(r);
+  return { context, page, close: () => context.close().catch(() => {}) };
+}
+
+// ---------- reading old Reddit pages ----------
+
+/**
+ * Runs inside the page (passed to page.evaluate, so it must be self-contained). Reads the
+ * logged-in username, listing posts (subreddit pages and a post's own page) and search results.
+ */
+export function extractOldReddit() {
+  const text = (el) => (el ? el.textContent.trim() : '');
+  const int = (s) => {
+    const m = String(s || '').replace(/,/g, '').match(/-?\d+/);
+    return m ? Number(m[0]) : 0;
   };
-  /** Reddit username of the profile's login, or null when logged out / unknown. */
-  const whoAmI = async () => {
+  const bodyText = document.body ? document.body.innerText.slice(0, 3000) : '';
+  const out = {
+    blocked: /blocked by network security|blocked due to a network policy/i.test(bodyText),
+    valid: !!document.querySelector('#header') && location.hostname === 'old.reddit.com',
+    user: text(document.querySelector('#header-bottom-right span.user > a:not(.login-required)')) || null,
+    items: [],
+  };
+  const seen = new Set();
+  for (const el of document.querySelectorAll('div.thing.link[data-fullname^="t3_"]')) {
+    const id = el.getAttribute('data-fullname');
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const cls = el.classList;
+    const md = el.querySelector('.expando .usertext-body .md');
+    out.items.push({
+      kind: 'thing',
+      id,
+      permalink: el.getAttribute('data-permalink') || '',
+      title: text(el.querySelector('a.title')),
+      createdMs: Number(el.getAttribute('data-timestamp')) || 0,
+      author: el.getAttribute('data-author') || '',
+      subreddit: el.getAttribute('data-subreddit') || '',
+      comments: int(el.getAttribute('data-comments-count')),
+      score: int(el.getAttribute('data-score')),
+      url: el.getAttribute('data-url') || '',
+      domain: el.getAttribute('data-domain') || '',
+      nsfw: el.getAttribute('data-nsfw') === 'true' || cls.contains('over18'),
+      promoted: el.getAttribute('data-promoted') === 'true' || cls.contains('promoted'),
+      stickied: cls.contains('stickied'),
+      locked: cls.contains('locked'),
+      archived: cls.contains('archived'),
+      flair: text(el.querySelector('.linkflairlabel')),
+      body: md ? md.innerText.trim() : '',
+    });
+  }
+  for (const el of document.querySelectorAll('div.search-result-link')) {
+    const id = el.getAttribute('data-fullname') || '';
+    if (id && seen.has(id)) continue;
+    if (id) seen.add(id);
+    const a = el.querySelector('a.search-title');
+    const c = el.querySelector('a.search-comments');
+    const t = el.querySelector('time[datetime]');
+    const titleHref = a ? a.getAttribute('href') || '' : '';
+    out.items.push({
+      kind: 'search',
+      id,
+      // On a link post the title points at the outside site; the comments link is the permalink.
+      permalink: (c && c.getAttribute('href')) || titleHref,
+      title: text(a),
+      createdMs: t ? Date.parse(t.getAttribute('datetime')) || 0 : 0,
+      author: text(el.querySelector('a.author')),
+      subreddit: text(el.querySelector('a.search-subreddit-link')).replace(/^\/?r\//, ''),
+      comments: int(text(c)),
+      score: int(text(el.querySelector('.search-score'))),
+      url: titleHref,
+      domain: '',
+      nsfw: !!el.querySelector('.nsfw-stamp'),
+      promoted: false,
+      stickied: false,
+      locked: false,
+      archived: false,
+      flair: text(el.querySelector('.linkflairlabel')),
+      body: text(el.querySelector('.search-result-body .md') || el.querySelector('.search-result-body')),
+    });
+  }
+  return out;
+}
+
+/** "/r/x/comments/id/slug/" from a relative or absolute Reddit link, or '' when it isn't one. */
+export function toPermalink(link) {
+  let p = String(link || '');
+  if (/^https?:\/\//.test(p)) {
     try {
-      await fetchImpl('https://www.reddit.com/api/me.json'); // makes sure the tab is on reddit.com
-      return await page.evaluate(async () => {
-        const r = await fetch('/api/me.json', { credentials: 'include' });
-        if (!r.ok) return null;
-        const j = await r.json().catch(() => null);
-        return j?.data?.name || j?.name || null;
-      });
+      const u = new URL(p);
+      if (!/(^|\.)reddit\.com$/.test(u.hostname)) return '';
+      p = u.pathname;
     } catch {
-      return null;
+      return '';
     }
-  };
-  return { context, page, fetchImpl, whoAmI, close: () => context.close().catch(() => {}) };
+  }
+  return /^\/r\/[^/]+\/comments\/[a-z0-9]+/i.test(p) ? p : '';
 }
 
-// Used only when the backend GET fails, so a backend hiccup still yields a useful run.
-export const FALLBACK_SETTINGS = {
-  searchQueries: [
-    '"remove google review"',
-    '"fake google review"',
-    '"fake review" google business',
-    '"negative review" removed',
-    '"bad review" google remove',
-    '"review bombed"',
-  ],
-  subredditGroups: [['GoogleMyBusiness', 'LocalSEO', 'smallbusiness', 'restaurateur', 'sweatystartup']],
-  lookbackHours: 36,
-};
-
-const REQUEST_GAP_MS = 5500; // + 0-1.5 s jitter = ~6.25 s average, under the ~10/min unauthenticated Reddit allows
-const MAX_429_WAIT_MS = 60_000;
-const BODY_MAX_CHARS = 4000;
-
-export function loadEnv(path) {
-  const env = {};
-  let text = '';
-  try {
-    text = readFileSync(path, 'utf8');
-  } catch {
-    return env;
-  }
-  for (const raw of text.split('\n')) {
-    const line = raw.trim();
-    if (!line || line.startsWith('#')) continue;
-    const m = line.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
-    if (!m) continue;
-    env[m[1]] = m[2].replace(/^(['"])(.*)\1$/, '$2');
-  }
-  return env;
-}
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-/** Map one Reddit listing child to the payload shape, or null when it can't take a comment. */
-export function toPost(child, cutoffUtc) {
-  if (!child || child.kind !== 't3' || !child.data) return null;
-  const d = child.data;
-  if (d.locked || d.archived || d.stickied || d.over_18) return null;
-  if (d.removed_by_category) return null;
-  if (d.author === '[deleted]' || d.selftext === '[removed]' || d.selftext === '[deleted]') return null;
-  if (!d.permalink || !d.created_utc || d.created_utc < cutoffUtc) return null;
+/** Map one item read from a page to the backend payload shape, or null when it can't take a comment. */
+export function fromItem(it, cutoffUtc) {
+  if (!it || it.nsfw || it.promoted || it.stickied || it.locked || it.archived) return null;
+  if (!it.author || it.author === '[deleted]' || it.body === '[removed]' || it.body === '[deleted]') return null;
+  const permalink = toPermalink(it.permalink);
+  const created = Math.round((it.createdMs || 0) / 1000);
+  if (!permalink || !created || created < cutoffUtc) return null;
+  const isSelf =
+    it.kind === 'search' ? !it.url || toPermalink(it.url) === permalink : String(it.domain).startsWith('self.');
   return {
-    title: String(d.title || ''),
-    selftext: String(d.selftext || '').slice(0, BODY_MAX_CHARS),
-    url: String(d.url || ''),
-    permalink: String(d.permalink),
-    created_utc: Number(d.created_utc),
-    subreddit: String(d.subreddit || ''),
-    num_comments: Number(d.num_comments || 0),
-    score: Number(d.score || 0),
-    author: d.author ? String(d.author) : undefined,
-    link_flair_text: d.link_flair_text ? String(d.link_flair_text) : undefined,
-    is_self: Boolean(d.is_self),
+    title: String(it.title || ''),
+    selftext: String(it.body || '').slice(0, BODY_MAX_CHARS),
+    url: isSelf || !it.url ? `https://www.reddit.com${permalink}` : String(it.url),
+    permalink,
+    created_utc: created,
+    subreddit: String(it.subreddit || permalink.split('/')[2] || ''),
+    num_comments: Number(it.comments || 0),
+    score: Number(it.score || 0),
+    author: String(it.author),
+    link_flair_text: it.flair ? String(it.flair) : undefined,
+    is_self: isSelf,
   };
 }
+
+/** Items the page had but that lack a link or date: a sign Reddit changed its markup. */
+export const unreadable = (items) => items.filter((it) => !toPermalink(it.permalink) || !it.createdMs).length;
 
 export function dedupe(posts) {
   const seen = new Set();
@@ -217,60 +305,60 @@ export function dedupe(posts) {
   });
 }
 
-export function buildUrls(settings) {
-  const urls = [];
+/** Pages to load: one search per query, one /new per subreddit group. */
+export function buildPages(settings) {
+  const pages = [];
   for (const q of settings.searchQueries || []) {
-    urls.push(
-      `https://www.reddit.com/search.json?q=${encodeURIComponent(q)}&sort=new&t=week&limit=100&type=link&raw_json=1`
-    );
+    pages.push({ search: true, url: `${OLD}/search?q=${encodeURIComponent(q)}&sort=new&t=week&type=link` });
   }
   for (const group of settings.subredditGroups || []) {
     if (!group.length) continue;
-    urls.push(`https://www.reddit.com/r/${group.map(encodeURIComponent).join('+')}/new.json?limit=100&raw_json=1`);
+    pages.push({ search: false, url: `${OLD}/r/${group.map(encodeURIComponent).join('+')}/new/?limit=100` });
   }
-  return urls;
+  return pages;
 }
 
-/** Fetch one listing. One retry after a 429, waiting what Reddit asks for (capped). */
-export async function fetchListing(url, health, fetchImpl = fetch) {
+/** Which new posts get their page opened for the text: search hits first, then review-ish titles. */
+export function pickForBody(posts, fromSearch, cap = MAX_BODY_FETCH) {
+  const want = posts.filter((p) => !p.selftext && (fromSearch.has(p.permalink) || REVIEWISH_RE.test(p.title)));
+  want.sort(
+    (a, b) => Number(fromSearch.has(b.permalink)) - Number(fromSearch.has(a.permalink)) || b.created_utc - a.created_utc
+  );
+  return want.slice(0, cap);
+}
+
+/** Load one old-Reddit page and read it; counts into health. Returns the extract or null. */
+export async function loadPage(page, url, health) {
   for (let attempt = 0; attempt < 2; attempt++) {
-    let res;
+    let status = 'none';
     try {
-      res = await fetchImpl(url, { headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' } });
+      const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+      status = resp ? resp.status() : 'none';
     } catch (err) {
-      health.errors.push(`network: ${err.message}`.slice(0, 200));
       health.failed++;
-      return [];
+      health.lastStatus = 'none';
+      health.errors.push(`load: ${String(err.message).split('\n')[0]} ${short(url)}`.slice(0, 200));
+      return null;
     }
-    health.statuses[res.status] = (health.statuses[res.status] || 0) + 1;
-    health.lastStatus = res.status;
-    if (res.status === 429 && attempt === 0) {
-      const reset = Number(res.headers.get('x-ratelimit-reset'));
-      const waitMs = Math.min(MAX_429_WAIT_MS, Number.isFinite(reset) && reset > 0 ? reset * 1000 : 30_000);
-      console.log(`  429, waiting ${Math.round(waitMs / 1000)}s`);
-      await sleep(waitMs);
+    health.statuses[status] = (health.statuses[status] || 0) + 1;
+    health.lastStatus = status;
+    if (status === 429 && attempt === 0) {
+      console.log('  429 (too many requests), waiting 30s');
+      await sleep(30_000);
       continue;
     }
-    const body = await res.text().catch(() => '');
-    if (LOGIN_WALL_RE.test(body)) health.loginWall = true;
-    if (res.status !== 200) {
-      health.failed++;
-      health.errors.push(`HTTP ${res.status}: ${url.replace('https://www.reddit.com', '')}`.slice(0, 200));
-      return [];
-    }
-    try {
-      const json = JSON.parse(body);
+    const data = await page.evaluate(extractOldReddit).catch(() => null);
+    if (status === 200 && data && data.valid && !data.blocked) {
       health.ok++;
-      return json?.data?.children || [];
-    } catch (err) {
-      health.failed++;
-      if (/<html/i.test(body)) health.loginWall = true; // login page instead of JSON
-      health.errors.push(`bad JSON (${err.message}): ${url.replace('https://www.reddit.com', '')}`.slice(0, 200));
-      return [];
+      return data;
     }
+    health.failed++;
+    if (status === 403 || data?.blocked) health.loginWall = true;
+    health.errors.push(`HTTP ${status}${data?.blocked ? ' block page' : ''}: ${short(url)}`.slice(0, 200));
+    return null;
   }
   health.failed++;
-  return [];
+  return null;
 }
 
 async function getSettings(endpoint, secret) {
@@ -290,19 +378,18 @@ async function getSettings(endpoint, secret) {
   }
 }
 
+// ---------- commands ----------
+
 const LOGIN_HINT = 'Reddit wants a login: run ./install-mac.sh login and log in in the Chrome window.';
+const TEST_URL = `${OLD}/r/GoogleMyBusiness/new/`;
+const who = (u) => (u ? `logged in as u/${u}` : 'NOT logged in');
 
-const TEST_URL = 'https://www.reddit.com/r/GoogleMyBusiness/new.json?limit=5&raw_json=1';
-
-/** One test request in an open browser; returns { ok, status, count, user, loginWall }. */
+/** One test page in an open browser. */
 async function probe(b) {
   const health = { requests: 1, ok: 0, failed: 0, statuses: {}, errors: [] };
-  const user = await b.whoAmI();
-  const children = await fetchListing(TEST_URL, health, b.fetchImpl);
-  return { ok: health.ok > 0, status: health.lastStatus ?? 'none', count: children.length, user, loginWall: !!health.loginWall, errors: health.errors };
+  const data = await loadPage(b.page, TEST_URL, health);
+  return { ok: !!data, status: health.lastStatus ?? 'none', count: data ? data.items.length : 0, user: data?.user || null };
 }
-
-const who = (u) => (u ? `logged in as u/${u}` : 'NOT logged in');
 
 /** `node scraper.mjs login`: visible Chrome on the monitor profile; you log in, press Enter. */
 async function login(env) {
@@ -349,95 +436,18 @@ async function check(env) {
       await b.close();
     }
     const label = mode === 'headless' ? 'background (no window)' : 'background (hidden window)';
-    if (p.ok) {
-      saveMode(env, mode);
+    if (p.ok && p.count > 0) {
+      writeState(env, 'browser-mode.txt', `${mode}\n`);
       console.log(`✅ Reddit OK in ${label} mode: ${who(p.user)}, ${p.count} posts read. Scheduled runs will use this mode.`);
       return;
     }
-    console.log(`   ${label}: Reddit refused (HTTP ${p.status}), ${who(p.user)}.`);
+    console.log(`   ${label}: Reddit refused or showed no posts (HTTP ${p.status}), ${who(p.user)}.`);
   }
   console.log(`❌ Reddit refused every mode. ${LOGIN_HINT}`);
   process.exitCode = 1;
 }
 
-/**
- * `node scraper.mjs probe`: Reddit refused the JSON listings even in a logged-in visible
- * window (2026-11-19), so this tries the other ways a browser can read the same posts and
- * writes what each returns to ~/Desktop/reddit-probe.txt (statuses, element counts, one
- * sample element per page) so the parser can be written against real markup.
- */
-const PROBE_PAGES = [
-  ['json via navigation', 'https://www.reddit.com/r/GoogleMyBusiness/new.json?limit=5&raw_json=1'],
-  ['old.reddit json via navigation', 'https://old.reddit.com/r/GoogleMyBusiness/new.json?limit=5&raw_json=1'],
-  ['new reddit subreddit page', 'https://www.reddit.com/r/GoogleMyBusiness/new/'],
-  ['new reddit search page', 'https://www.reddit.com/search/?q=%22google+review%22&type=posts&sort=new&t=week'],
-  ['old reddit subreddit page', 'https://old.reddit.com/r/GoogleMyBusiness/new/'],
-  ['old reddit search page', 'https://old.reddit.com/search?q=%22google+review%22&sort=new&t=week'],
-  ['rss', 'https://www.reddit.com/r/GoogleMyBusiness/new/.rss'],
-];
-const PROBE_SELECTORS = [
-  'shreddit-post',
-  'a[data-testid="post-title"]',
-  '[data-testid="search-post-unit"]',
-  'search-telemetry-tracker',
-  'faceplate-tracker[noun="post"]',
-  'div.thing',
-  'div.search-result-link',
-  'entry',
-];
-
-async function probeAll(env) {
-  const out = [`reddit-monitor probe ${new Date().toISOString()}`];
-  for (const mode of ['headless', 'visible']) {
-    let b;
-    try {
-      b = await openBrowser(env, { mode });
-    } catch (err) {
-      out.push(`[${mode}] cannot start Chrome: ${err.message}`);
-      continue;
-    }
-    try {
-      out.push(`\n===== mode: ${mode}, ${who(await b.whoAmI())}`);
-      for (const [label, url] of PROBE_PAGES) {
-        let status = 'none';
-        try {
-          const resp = await b.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45_000 });
-          status = resp ? resp.status() : 'none';
-          await sleep(4000);
-          const info = await b.page.evaluate((sels) => {
-            const counts = {};
-            let sample = '';
-            for (const sel of sels) {
-              const els = document.querySelectorAll(sel);
-              counts[sel] = els.length;
-              if (!sample && els.length) sample = `${sel}: ${els[0].outerHTML.slice(0, 3500)}`;
-            }
-            const text = (document.body ? document.body.innerText : document.documentElement.textContent || '').slice(0, 300);
-            return { counts, sample, text, title: document.title };
-          }, PROBE_SELECTORS);
-          const nonzero = Object.entries(info.counts).filter(([, n]) => n).map(([k, n]) => `${k}=${n}`).join(', ') || 'no posts found';
-          console.log(`  [${mode}] ${label}: HTTP ${status}, ${nonzero}`);
-          out.push(`\n--- ${label} | HTTP ${status} | title: ${info.title}\ncounts: ${nonzero}\ntext: ${info.text.replace(/\s+/g, ' ')}\nsample: ${info.sample}`);
-        } catch (err) {
-          console.log(`  [${mode}] ${label}: HTTP ${status}, error ${err.message.split('\n')[0]}`);
-          out.push(`\n--- ${label} | HTTP ${status} | error ${err.message.split('\n')[0]}`);
-        }
-        await sleep(2500);
-      }
-    } finally {
-      await b.close();
-    }
-  }
-  const file = join(homedir(), 'Desktop', 'reddit-probe.txt');
-  writeFileSync(file, out.join('\n') + '\n');
-  console.log(`📄 Wrote ${file}: send this file in Telegram.`);
-}
-
-async function main() {
-  const env = { ...loadEnv(join(HERE, '.env')), ...process.env };
-  if (process.argv[2] === 'login') return login(env);
-  if (process.argv[2] === 'check') return check(env);
-  if (process.argv[2] === 'probe') return probeAll(env);
+async function run(env) {
   const endpoint = env.RM_ENDPOINT;
   const secret = env.RM_SECRET;
   if (!endpoint || !secret) {
@@ -450,34 +460,64 @@ async function main() {
   const { settings, fromBackend } = await getSettings(endpoint, secret);
   const lookbackHours = Number(settings.lookbackHours) > 0 ? Number(settings.lookbackHours) : 36;
   const cutoffUtc = Date.now() / 1000 - lookbackHours * 3600;
-
-  const urls = buildUrls(settings);
-  const health = { requests: urls.length, ok: 0, failed: 0, statuses: {}, errors: [], settingsFromBackend: fromBackend };
+  const pages = buildPages(settings);
+  const health = { requests: 0, ok: 0, failed: 0, statuses: {}, errors: [], settingsFromBackend: fromBackend };
+  const sent = pruneSent(loadSent(env));
   let posts = [];
-  let browser;
+  const fromSearch = new Set();
+  let badItems = 0;
+
+  let browser = null;
   try {
     browser = await openBrowser(env, { mode: savedMode(env) });
   } catch (err) {
     // Still report to the backend: ok = 0 makes it send the "blocked" Telegram alert.
     console.log(`❌ ${err.message}`);
-    health.failed = urls.length;
+    health.requests = pages.length;
+    health.failed = pages.length;
     health.errors.push(`browser: ${err.message}`.slice(0, 200));
-    browser = { fetchImpl: null, close: async () => {} };
   }
-  try {
-    for (const [i, url] of (browser.fetchImpl ? urls : []).entries()) {
-      const children = await fetchListing(url, health, browser.fetchImpl);
-      const kept = children.map((c) => toPost(c, cutoffUtc)).filter(Boolean);
-      console.log(`  HTTP ${health.lastStatus ?? '-'} ${url.replace('https://www.reddit.com', '').slice(0, 84)} → ${children.length} items, ${kept.length} kept`);
-      posts.push(...kept);
-      if (i < urls.length - 1) await sleep(REQUEST_GAP_MS + Math.random() * 1500);
+  if (browser) {
+    try {
+      for (const [i, pg] of pages.entries()) {
+        health.requests++;
+        const data = await loadPage(browser.page, pg.url, health);
+        const items = data ? data.items : [];
+        badItems += unreadable(items);
+        const kept = items.map((it) => fromItem(it, cutoffUtc)).filter(Boolean);
+        const fresh = kept.filter((p) => !sent[p.permalink]);
+        if (pg.search) for (const p of fresh) fromSearch.add(p.permalink);
+        console.log(`  HTTP ${health.lastStatus ?? '-'} ${short(pg.url)} → ${items.length} items, ${kept.length} recent, ${fresh.length} new`);
+        posts.push(...fresh);
+        if (i < pages.length - 1) await gap();
+      }
+      posts = dedupe(posts);
+      const toRead = pickForBody(posts, fromSearch);
+      if (toRead.length) console.log(`  reading the text of ${toRead.length} posts`);
+      for (const p of toRead) {
+        await gap();
+        health.requests++;
+        const data = await loadPage(browser.page, `${OLD}${p.permalink}`, health);
+        const it = data?.items.find((x) => toPermalink(x.permalink) === p.permalink);
+        if (!it) continue;
+        const full = fromItem(it, 0);
+        if (!full) {
+          posts = posts.filter((x) => x.permalink !== p.permalink); // locked/removed since the listing
+          continue;
+        }
+        if (full.selftext) p.selftext = full.selftext;
+        if (full.link_flair_text && !p.link_flair_text) p.link_flair_text = full.link_flair_text;
+      }
+    } finally {
+      await browser.close();
     }
-  } finally {
-    await browser.close();
   }
-  posts = dedupe(posts);
+  if (badItems) {
+    health.errors.push(`parse: ${badItems} posts without a link or date (Reddit page layout changed?)`);
+    console.log(`⚠️ ${badItems} posts had no link or date: Reddit may have changed its page layout.`);
+  }
   health.durationS = Math.round((Date.now() - started) / 1000);
-  console.log(`📊 ${health.ok}/${urls.length} requests ok, ${posts.length} posts in the last ${lookbackHours}h`);
+  console.log(`📊 ${health.ok}/${health.requests} pages ok, ${posts.length} new posts in the last ${lookbackHours}h`);
   if (health.loginWall) console.log(`❌ ${LOGIN_HINT}`);
 
   let res;
@@ -485,7 +525,7 @@ async function main() {
     res = await fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${secret}` },
-      body: JSON.stringify({ source: 'laptop-scraper/2', posts, health }),
+      body: JSON.stringify({ source: 'laptop-scraper/3', posts, health }),
     });
   } catch (err) {
     console.error(`❌ backend POST failed: ${err.message}`);
@@ -494,7 +534,18 @@ async function main() {
   const text = await res.text();
   console.log(`📬 ${res.status} ${text.slice(0, 1500)}`);
   if (!res.ok) process.exit(1);
+  const nowS = Math.round(Date.now() / 1000);
+  for (const p of posts) sent[p.permalink] = nowS;
+  writeState(env, 'sent.json', JSON.stringify(sent));
   console.log(`✅ done in ${((Date.now() - started) / 1000).toFixed(1)}s`);
+}
+
+async function main() {
+  const env = { ...loadEnv(join(HERE, '.env')), ...process.env };
+  const cmd = process.argv[2];
+  if (cmd === 'login') return login(env);
+  if (cmd === 'check') return check(env);
+  return run(env);
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {

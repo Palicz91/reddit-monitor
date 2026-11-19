@@ -1,6 +1,6 @@
 {
   "name": "reddit-monitor",
-  "version": "2.1.0",
+  "version": "3.0.0",
   "private": true,
   "description": "Laptop-side Reddit scraper for the ReviewTactic review-removal monitor",
   "type": "module",

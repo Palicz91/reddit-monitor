@@ -3,21 +3,26 @@
 Finds Reddit posts where business owners ask how to get a negative, fake or unfair
 Google review removed, and sends them to Telegram with a suggested reply.
 
-Reddit blocks its JSON endpoints from datacenter IPs (servers get HTTP 403), so the
-fetching runs on a Mac with a home connection. Since November 2026 Reddit also blocks every
-logged-out read ("You've been blocked by network security") and non-browser clients, so the
-scraper reads Reddit through the Mac's real Google Chrome (via `playwright-core`, which
-downloads no browser), on its own Chrome profile that you log into once (see "Reddit login"). Everything else (which posts matter,
+Reddit blocks servers (HTTP 403 from datacenter IPs), so the scraper runs on a Mac with a home
+connection. Since November 2026 Reddit also blocks every logged-out read ("You've been blocked by
+network security"), every non-browser client, and its `.json` listings even for a logged-in
+browser. Normal old.reddit.com pages still load for a logged-in Chrome, so the scraper drives the
+Mac's real Google Chrome (via `playwright-core`, which downloads no browser) on its own Chrome
+profile that you log into once (see "Reddit login"), and reads old Reddit's search and subreddit
+pages. Everything else (which posts matter,
 scoring, drafts, Telegram, remembering what was already seen) runs on the ReviewTactic
 backend. This repo holds no prompts and no secrets.
 
 ## How a run works
 
 1. Asks the backend for this run's settings (search phrases, subreddits, how far back to look).
-2. Fetches Reddit: one Reddit-wide search per phrase, plus the newest posts of a few subreddit groups.
-   About 12 requests, spaced ~6 s apart (under Reddit's ~10 a minute). A 429 waits once and retries.
-3. Skips posts that can't take a comment (locked, archived, removed, NSFW) and posts older than the window.
-4. Sends the posts and a health block (request count, HTTP statuses) to the backend.
+2. Loads old Reddit pages in Chrome (headless): one Reddit-wide search per phrase (newest first,
+   past week), plus the newest posts of a few subreddit groups. About 12 pages, ~6 s apart.
+   A 429 waits 30 s once and retries.
+3. Skips posts that can't take a comment (locked, archived, removed, stickied, NSFW, ads), posts
+   older than the window and posts sent in an earlier run (`sent.json` next to the profile, 4 days).
+   Then opens up to 20 new posts that may be about reviews to read their text.
+4. Sends the posts and a health block (page count, HTTP statuses) to the backend.
    If Reddit blocked every request, the backend sends one Telegram alert (at most every 12 h)
    instead of treating it as a quiet day.
 
@@ -38,7 +43,7 @@ git clone https://github.com/Palicz91/reddit-monitor.git
 cd reddit-monitor/reddit-monitor
 cp .env.example .env        # then put the secret you were given into RM_SECRET
 ./install-mac.sh login      # Chrome opens: log in to Reddit, then press Enter in the terminal
-./install-mac.sh check      # one Reddit request: "Reddit OK" means reading works
+./install-mac.sh check      # one Reddit page: "Reddit OK" means reading works
 ./install-mac.sh run        # one test run in the terminal
 ./install-mac.sh            # install: runs every 3 hours, catches up after sleep
 ```

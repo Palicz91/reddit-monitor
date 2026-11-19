@@ -6,8 +6,7 @@
 #   ./install-mac.sh uninstall  remove
 #   ./install-mac.sh run        run once now in this terminal (to test)
 #   ./install-mac.sh login      open Chrome on the monitor's own profile to log in to Reddit (once)
-#   ./install-mac.sh check      one Reddit request through that Chrome: does reading work?
-#   ./install-mac.sh probe      diagnostics: which Reddit pages the logged-in Chrome can read
+#   ./install-mac.sh check      one Reddit page through that Chrome: does reading work?
 set -euo pipefail
 
 LABEL="com.reviewtactic.reddit-monitor"
@@ -57,10 +56,6 @@ fi
 
 if [ "${1:-}" = "login" ]; then
   exec "$NODE" "$DIR/scraper.mjs" login
-fi
-
-if [ "${1:-}" = "probe" ]; then
-  exec "$NODE" "$DIR/scraper.mjs" probe
 fi
 
 if [ "${1:-}" = "check" ]; then
