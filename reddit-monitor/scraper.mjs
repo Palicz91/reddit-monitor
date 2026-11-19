@@ -360,10 +360,84 @@ async function check(env) {
   process.exitCode = 1;
 }
 
+/**
+ * `node scraper.mjs probe`: Reddit refused the JSON listings even in a logged-in visible
+ * window (2026-11-19), so this tries the other ways a browser can read the same posts and
+ * writes what each returns to ~/Desktop/reddit-probe.txt (statuses, element counts, one
+ * sample element per page) so the parser can be written against real markup.
+ */
+const PROBE_PAGES = [
+  ['json via navigation', 'https://www.reddit.com/r/GoogleMyBusiness/new.json?limit=5&raw_json=1'],
+  ['old.reddit json via navigation', 'https://old.reddit.com/r/GoogleMyBusiness/new.json?limit=5&raw_json=1'],
+  ['new reddit subreddit page', 'https://www.reddit.com/r/GoogleMyBusiness/new/'],
+  ['new reddit search page', 'https://www.reddit.com/search/?q=%22google+review%22&type=posts&sort=new&t=week'],
+  ['old reddit subreddit page', 'https://old.reddit.com/r/GoogleMyBusiness/new/'],
+  ['old reddit search page', 'https://old.reddit.com/search?q=%22google+review%22&sort=new&t=week'],
+  ['rss', 'https://www.reddit.com/r/GoogleMyBusiness/new/.rss'],
+];
+const PROBE_SELECTORS = [
+  'shreddit-post',
+  'a[data-testid="post-title"]',
+  '[data-testid="search-post-unit"]',
+  'search-telemetry-tracker',
+  'faceplate-tracker[noun="post"]',
+  'div.thing',
+  'div.search-result-link',
+  'entry',
+];
+
+async function probeAll(env) {
+  const out = [`reddit-monitor probe ${new Date().toISOString()}`];
+  for (const mode of ['headless', 'visible']) {
+    let b;
+    try {
+      b = await openBrowser(env, { mode });
+    } catch (err) {
+      out.push(`[${mode}] cannot start Chrome: ${err.message}`);
+      continue;
+    }
+    try {
+      out.push(`\n===== mode: ${mode}, ${who(await b.whoAmI())}`);
+      for (const [label, url] of PROBE_PAGES) {
+        let status = 'none';
+        try {
+          const resp = await b.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+          status = resp ? resp.status() : 'none';
+          await sleep(4000);
+          const info = await b.page.evaluate((sels) => {
+            const counts = {};
+            let sample = '';
+            for (const sel of sels) {
+              const els = document.querySelectorAll(sel);
+              counts[sel] = els.length;
+              if (!sample && els.length) sample = `${sel}: ${els[0].outerHTML.slice(0, 3500)}`;
+            }
+            const text = (document.body ? document.body.innerText : document.documentElement.textContent || '').slice(0, 300);
+            return { counts, sample, text, title: document.title };
+          }, PROBE_SELECTORS);
+          const nonzero = Object.entries(info.counts).filter(([, n]) => n).map(([k, n]) => `${k}=${n}`).join(', ') || 'no posts found';
+          console.log(`  [${mode}] ${label}: HTTP ${status}, ${nonzero}`);
+          out.push(`\n--- ${label} | HTTP ${status} | title: ${info.title}\ncounts: ${nonzero}\ntext: ${info.text.replace(/\s+/g, ' ')}\nsample: ${info.sample}`);
+        } catch (err) {
+          console.log(`  [${mode}] ${label}: HTTP ${status}, error ${err.message.split('\n')[0]}`);
+          out.push(`\n--- ${label} | HTTP ${status} | error ${err.message.split('\n')[0]}`);
+        }
+        await sleep(2500);
+      }
+    } finally {
+      await b.close();
+    }
+  }
+  const file = join(homedir(), 'Desktop', 'reddit-probe.txt');
+  writeFileSync(file, out.join('\n') + '\n');
+  console.log(`📄 Wrote ${file}: send this file in Telegram.`);
+}
+
 async function main() {
   const env = { ...loadEnv(join(HERE, '.env')), ...process.env };
   if (process.argv[2] === 'login') return login(env);
   if (process.argv[2] === 'check') return check(env);
+  if (process.argv[2] === 'probe') return probeAll(env);
   const endpoint = env.RM_ENDPOINT;
   const secret = env.RM_SECRET;
   if (!endpoint || !secret) {
