@@ -96,6 +96,9 @@ test('toPermalink accepts relative and reddit absolute links only', () => {
 
 test('unreadable counts items without link or date', () => {
   assert.equal(unreadable([item(), item({ createdMs: 0 }), item({ permalink: '' })]).length, 2);
+  // Profile posts (job ads on a user's own page) are skipped quietly, not a markup warning.
+  assert.equal(unreadable([item({ permalink: 'https://old.reddit.com/user/Find_Your_Job/comments/1y05j5e/for_hire/' })]).length, 0);
+  assert.equal(unreadable([item({ permalink: '/user/x/comments/abc/t/', createdMs: 0 })]).length, 0);
 });
 
 test('dedupe keeps the first copy by permalink', () => {

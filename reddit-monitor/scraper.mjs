@@ -298,8 +298,12 @@ export function fromItem(it, cutoffUtc) {
   };
 }
 
+/** A post on someone's own profile (/user/x/comments/...): readable, just not in a subreddit, so skipped quietly. */
+export const isProfilePost = (link) => /^(?:https?:\/\/[^/]*reddit\.com)?\/(?:user|u)\/[^/]+\/comments\//i.test(String(link || ''));
+
 /** Items the page had but that lack a link or date: a sign Reddit changed its markup. */
-export const unreadable = (items) => items.filter((it) => !toPermalink(it.permalink) || !it.createdMs);
+export const unreadable = (items) =>
+  items.filter((it) => !isProfilePost(it.permalink) && (!toPermalink(it.permalink) || !it.createdMs));
 
 export function dedupe(posts) {
   const seen = new Set();
