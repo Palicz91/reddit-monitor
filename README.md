@@ -4,7 +4,9 @@ Finds Reddit posts where business owners ask how to get a negative, fake or unfa
 Google review removed, and sends them to Telegram with a suggested reply.
 
 Reddit blocks its JSON endpoints from datacenter IPs (servers get HTTP 403), so the
-fetching runs on a Mac with a home connection. Everything else (which posts matter,
+fetching runs on a Mac with a home connection. Since November 2026 Reddit also blocks every
+logged-out read ("You've been blocked by network security"), so the scraper sends a Reddit
+login cookie (see "Reddit login" below). Everything else (which posts matter,
 scoring, drafts, Telegram, remembering what was already seen) runs on the ReviewTactic
 backend. This repo holds no prompts and no secrets.
 
@@ -34,6 +36,8 @@ launchctl list | grep -i reddit             # if found: launchctl remove <label>
 git clone https://github.com/Palicz91/reddit-monitor.git
 cd reddit-monitor/reddit-monitor
 cp .env.example .env        # then put the secret you were given into RM_SECRET
+                            # and the Reddit login into REDDIT_COOKIE (next section)
+./install-mac.sh check      # one Reddit request: "Reddit OK" means the login works
 ./install-mac.sh run        # one test run in the terminal
 ./install-mac.sh            # install: runs every 3 hours, catches up after sleep
 ```
@@ -44,6 +48,26 @@ cp .env.example .env        # then put the secret you were given into RM_SECRET
 
 The Mac must be awake and online for a run. The backend looks back 36 hours, so a laptop
 that sleeps overnight still catches everything when it wakes. Posts are never sent twice.
+
+## Reddit login
+
+Reddit only answers logged-in requests now. The scraper reads 12 pages every 3 hours as
+that account, so a spare Reddit account is safest (it never posts anything).
+
+1. In Chrome, log in to reddit.com with the account to use.
+2. Press Cmd+Option+I (Developer Tools) → **Application** tab → left side **Cookies** →
+   `https://www.reddit.com`.
+3. Click the row named `reddit_session`, copy its **Value** (the long text starting `eyJ`).
+4. Paste it into `.env` after `REDDIT_COOKIE=`, save, and run `./install-mac.sh check`.
+
+If `check` still says refused, copy the whole cookie line instead: Developer Tools →
+**Network** tab → reload the page → click the first request → **Request Headers** →
+right-click `cookie` → copy value, and paste that after `REDDIT_COOKIE=`.
+
+The login lasts months. When it expires, runs print "Reddit no longer accepts the login"
+and the backend sends its "blocked by Reddit" Telegram alert: copy a fresh value the same
+way. Logging out of Reddit in that browser ends the session too, so use a browser profile
+you stay logged in on. The cookie stays in `.env` on the Mac and is only sent to reddit.com.
 
 ## Changing what is searched
 

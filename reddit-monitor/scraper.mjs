@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-// Reddit monitor, laptop side. Runs from launchd on a Mac (residential IP: Reddit
-// returns 403 to the VPS and other datacenter IPs for its JSON endpoints).
+// Reddit monitor, laptop side. Runs from launchd on a Mac. Since Nov 2026 Reddit blocks
+// every logged-out read ("blocked by network security"), from home connections too, so
+// requests carry the Reddit login cookie from .env (REDDIT_COOKIE).
 //
 // One run:
 //   1. GET the backend for this run's settings (search queries, subreddits, lookback).
@@ -25,6 +26,21 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 // Same browser UA the old scraper used from this laptop without being blocked.
 const USER_AGENT =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
+/** Reddit's block pages for logged-out or rejected-login requests (two wordings seen, Nov 2026). */
+export const LOGIN_WALL_RE = /blocked by network security|blocked due to a network policy|try logging in/i;
+
+/**
+ * Request headers. REDDIT_COOKIE is either the reddit_session value on its own, or a whole
+ * Cookie header copied from the browser ("name=value; name2=value2"). Never logged or sent
+ * anywhere but reddit.com.
+ */
+export function redditHeaders(cookie) {
+  const headers = { 'User-Agent': USER_AGENT, Accept: 'application/json' };
+  const c = String(cookie || '').trim().replace(/^cookie:\s*/i, '');
+  if (c) headers.Cookie = /^[A-Za-z_][\w-]*=/.test(c) || c.includes(';') ? c : `reddit_session=${c}`;
+  return headers;
+}
 
 // Used only when the backend GET fails, so a backend hiccup still yields a useful run.
 export const FALLBACK_SETTINGS = {
@@ -111,17 +127,18 @@ export function buildUrls(settings) {
 }
 
 /** Fetch one listing. One retry after a 429, waiting what Reddit asks for (capped). */
-async function fetchListing(url, health, fetchImpl = fetch) {
+export async function fetchListing(url, health, fetchImpl = fetch, headers = redditHeaders()) {
   for (let attempt = 0; attempt < 2; attempt++) {
     let res;
     try {
-      res = await fetchImpl(url, { headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' } });
+      res = await fetchImpl(url, { headers });
     } catch (err) {
       health.errors.push(`network: ${err.message}`.slice(0, 200));
       health.failed++;
       return [];
     }
     health.statuses[res.status] = (health.statuses[res.status] || 0) + 1;
+    health.lastStatus = res.status;
     if (res.status === 429 && attempt === 0) {
       const reset = Number(res.headers.get('x-ratelimit-reset'));
       const waitMs = Math.min(MAX_429_WAIT_MS, Number.isFinite(reset) && reset > 0 ? reset * 1000 : 30_000);
@@ -129,17 +146,20 @@ async function fetchListing(url, health, fetchImpl = fetch) {
       await sleep(waitMs);
       continue;
     }
+    const body = await res.text().catch(() => '');
+    if (LOGIN_WALL_RE.test(body)) health.loginWall = true;
     if (res.status !== 200) {
       health.failed++;
       health.errors.push(`HTTP ${res.status}: ${url.replace('https://www.reddit.com', '')}`.slice(0, 200));
       return [];
     }
     try {
-      const json = await res.json();
+      const json = JSON.parse(body);
       health.ok++;
       return json?.data?.children || [];
     } catch (err) {
       health.failed++;
+      if (/<html/i.test(body)) health.loginWall = true; // login page instead of JSON
       health.errors.push(`bad JSON (${err.message}): ${url.replace('https://www.reddit.com', '')}`.slice(0, 200));
       return [];
     }
@@ -165,8 +185,34 @@ async function getSettings(endpoint, secret) {
   }
 }
 
+function loginHint(cookie) {
+  return cookie
+    ? 'Reddit no longer accepts the login in REDDIT_COOKIE: copy a fresh one (README, "Reddit login").'
+    : 'Reddit needs a login: add REDDIT_COOKIE to .env (README, "Reddit login").';
+}
+
+/** `node scraper.mjs check`: one Reddit request, prints whether the login works. No backend call. */
+async function check(cookie) {
+  const health = { requests: 1, ok: 0, failed: 0, statuses: {}, errors: [] };
+  const children = await fetchListing(
+    'https://www.reddit.com/r/GoogleMyBusiness/new.json?limit=5&raw_json=1',
+    health,
+    fetch,
+    redditHeaders(cookie)
+  );
+  if (health.ok) {
+    console.log(`✅ Reddit OK (HTTP ${health.lastStatus}, ${children.length} posts read).`);
+    return;
+  }
+  console.log(`❌ Reddit refused (HTTP ${health.lastStatus ?? 'none'}). ${health.loginWall ? loginHint(cookie) : health.errors.join('; ')}`);
+  process.exit(1);
+}
+
 async function main() {
   const env = { ...loadEnv(join(HERE, '.env')), ...process.env };
+  const cookie = env.REDDIT_COOKIE;
+  if (process.argv[2] === 'check') return check(cookie);
+  if (!cookie) console.log('⚠️ REDDIT_COOKIE is not set; Reddit blocks logged-out reads (README, "Reddit login").');
   const endpoint = env.RM_ENDPOINT;
   const secret = env.RM_SECRET;
   if (!endpoint || !secret) {
@@ -184,15 +230,17 @@ async function main() {
   const health = { requests: urls.length, ok: 0, failed: 0, statuses: {}, errors: [], settingsFromBackend: fromBackend };
   let posts = [];
   for (const [i, url] of urls.entries()) {
-    const children = await fetchListing(url, health);
+    const headers = redditHeaders(cookie);
+    const children = await fetchListing(url, health, fetch, headers);
     const kept = children.map((c) => toPost(c, cutoffUtc)).filter(Boolean);
-    console.log(`  ${url.replace('https://www.reddit.com', '').slice(0, 90)} → ${children.length} items, ${kept.length} kept`);
+    console.log(`  HTTP ${health.lastStatus ?? '-'} ${url.replace('https://www.reddit.com', '').slice(0, 84)} → ${children.length} items, ${kept.length} kept`);
     posts.push(...kept);
     if (i < urls.length - 1) await sleep(REQUEST_GAP_MS + Math.random() * 1500);
   }
   posts = dedupe(posts);
   health.durationS = Math.round((Date.now() - started) / 1000);
   console.log(`📊 ${health.ok}/${urls.length} requests ok, ${posts.length} posts in the last ${lookbackHours}h`);
+  if (health.loginWall) console.log(`❌ ${loginHint(cookie)}`);
 
   let res;
   try {

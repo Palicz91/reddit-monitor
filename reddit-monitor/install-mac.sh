@@ -5,6 +5,7 @@
 #   ./install-mac.sh            install or update
 #   ./install-mac.sh uninstall  remove
 #   ./install-mac.sh run        run once now in this terminal (to test)
+#   ./install-mac.sh check      one Reddit request: does the login in .env work?
 set -euo pipefail
 
 LABEL="com.reviewtactic.reddit-monitor"
@@ -36,6 +37,10 @@ if [ ! -f "$DIR/.env" ]; then
   exit 1
 fi
 chmod 600 "$DIR/.env"
+
+if [ "${1:-}" = "check" ]; then
+  exec "$NODE" "$DIR/scraper.mjs" check
+fi
 
 if [ "${1:-}" = "run" ]; then
   exec "$NODE" "$DIR/scraper.mjs"
