@@ -55,10 +55,10 @@ export const FALLBACK_SETTINGS = {
     '"fake google review"',
     '"fake review" google',
     '"negative review" google',
-    '"bad review" google remove',
+    '"bad review" google',
     '"1 star review" google',
     '"never a customer" review',
-    'google review extortion',
+    '"google review" extortion',
   ],
   subredditGroups: [
     ['GoogleMyBusiness', 'googleReviews', 'restaurantowners', 'sweatystartup', 'Contractor', 'handyman'],
