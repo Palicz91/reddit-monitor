@@ -111,7 +111,7 @@ test('buildPages: one old-Reddit search per query, one /new per group', () => {
   const pages = buildPages({ searchQueries: ['"fake review"'], subredditGroups: [['a', 'b'], []] });
   assert.equal(pages.length, 2);
   assert.equal(pages[0].search, true);
-  assert.equal(pages[0].url, `${OLD}/search?q=%22fake%20review%22&sort=new&t=week&type=link`);
+  assert.equal(pages[0].url, `${OLD}/search?q=%22fake%20review%22&sort=new&t=week&type=link&limit=100`);
   assert.equal(pages[1].search, false);
   assert.equal(pages[1].url, `${OLD}/r/a+b/new/?limit=100`);
 });

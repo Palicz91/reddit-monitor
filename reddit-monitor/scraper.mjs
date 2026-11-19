@@ -52,14 +52,20 @@ const TEXT_KEEP_HOURS = 96;
 // Used only when the backend GET fails, so a backend hiccup still yields a useful run.
 export const FALLBACK_SETTINGS = {
   searchQueries: [
-    '"remove google review"',
     '"fake google review"',
-    '"fake review" google business',
-    '"negative review" removed',
+    '"fake review" google',
+    '"negative review" google',
     '"bad review" google remove',
-    '"review bombed"',
+    '"1 star review" google',
+    '"never a customer" review',
+    'google review extortion',
   ],
-  subredditGroups: [['GoogleMyBusiness', 'LocalSEO', 'smallbusiness', 'restaurateur', 'sweatystartup']],
+  subredditGroups: [
+    ['GoogleMyBusiness', 'googleReviews', 'restaurantowners', 'sweatystartup', 'Contractor', 'handyman'],
+    ['smallbusiness'],
+    ['LawFirm', 'realtors', 'PropertyManagement', 'Landlord', 'askcarsales', 'AutoBodyRepair'],
+    ['Dentistry', 'Chiropractic', 'Veterinary', 'Roofing', 'HVAC', 'travelagents'],
+  ],
   lookbackHours: 36,
 };
 
@@ -318,7 +324,7 @@ export function dedupe(posts) {
 export function buildPages(settings) {
   const pages = [];
   for (const q of settings.searchQueries || []) {
-    pages.push({ search: true, url: `${OLD}/search?q=${encodeURIComponent(q)}&sort=new&t=week&type=link` });
+    pages.push({ search: true, url: `${OLD}/search?q=${encodeURIComponent(q)}&sort=new&t=week&type=link&limit=100` });
   }
   for (const group of settings.subredditGroups || []) {
     if (!group.length) continue;
