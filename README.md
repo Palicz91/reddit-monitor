@@ -1,196 +1,51 @@
-# Reddit Comment Monitor
+# Reddit monitor (laptop scraper)
 
-AI-powered system that monitors Reddit, finds posts worth commenting on, generates draft comments, and delivers them to Telegram. ~$2/month.
+Finds Reddit posts where business owners ask how to get a negative, fake or unfair
+Google review removed, and sends them to Telegram with a suggested reply.
 
-## How it works
+Reddit blocks its JSON endpoints from datacenter IPs (servers get HTTP 403), so the
+fetching runs on a Mac with a home connection. Everything else (which posts matter,
+scoring, drafts, Telegram, remembering what was already seen) runs on the ReviewTactic
+backend. This repo holds no prompts and no secrets.
 
-```
-Your Laptop (Playwright)  →  Supabase Edge Function  →  Telegram
-     scrapes Reddit             scores + drafts            you get notified
-```
+## How a run works
 
-1. **Scraper** runs on your laptop every 3 hours (cron)
-2. Scrapes new posts from your chosen subreddits
-3. Sends posts + your config to Supabase Edge Function
-4. Edge Function filters by keywords, scores with AI, generates draft comments
-5. You get a Telegram message with the post + draft comment to copy/paste
+1. Asks the backend for this run's settings (search phrases, subreddits, how far back to look).
+2. Fetches Reddit: one Reddit-wide search per phrase, plus the newest posts of a few subreddit groups.
+   About 12 requests, spaced ~6 s apart (under Reddit's ~10 a minute). A 429 waits once and retries.
+3. Skips posts that can't take a comment (locked, archived, removed, NSFW) and posts older than the window.
+4. Sends the posts and a health block (request count, HTTP statuses) to the backend.
+   If Reddit blocked every request, the backend sends one Telegram alert (at most every 12 h)
+   instead of treating it as a quiet day.
 
-## What you need
+## Setup (Mac)
 
-- A laptop (Mac/Linux/Windows)
-- Node.js installed
-- A Supabase account (free)
-- A Telegram account
-- An Anthropic API key (~$2/month usage)
+Needs Node.js 18 or newer (`node --version`).
 
-## Setup (15 minutes)
-
-### Step 1: Clone and install
+**Remove the old version first.** The 2026 version ran `~/Desktop/reddit-monitor-laptop.js` from a
+schedule that is still firing (its log fills with `Cannot find module`). Find it and delete that line or job:
 
 ```bash
-git clone <this-repo>
-cd desktop/scraper/reddit-monitor
-npm install
-npx playwright install chromium
+crontab -l | grep -n reddit                 # if found: crontab -e and delete the line
+launchctl list | grep -i reddit             # if found: launchctl remove <label>, then delete its plist in ~/Library/LaunchAgents
 ```
-
-### Step 2: Create a Telegram bot
-
-1. Open Telegram, search for `@BotFather`
-2. Send `/newbot`
-3. Choose a name (e.g. "My Reddit Monitor")
-4. Choose a username (e.g. "myredditmonitor_bot")
-5. Copy the **bot token** (looks like `123456:ABC-DEF...`)
-6. Send a message to your new bot
-7. Open `https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates`
-8. Find your `chat_id` in the response (a number like `123456789`)
-
-Save both the **bot token** and **chat id**.
-
-### Step 3: Get an Anthropic API key
-
-1. Go to https://console.anthropic.com
-2. Create an account / sign in
-3. Go to API Keys → Create Key
-4. Copy the key (starts with `sk-ant-...`)
-
-### Step 4: Set up Supabase
-
-1. Go to https://supabase.com → New Project
-2. Choose a name, set a password, pick a region close to you
-3. Wait for the project to be created
-
-**Create the database tables:**
-1. Go to SQL Editor (left sidebar)
-2. Paste the contents of `setup.sql` and click Run
-
-**Deploy the Edge Function:**
-1. Install the Supabase CLI: https://supabase.com/docs/guides/cli
-2. Link your project:
-```bash
-supabase login
-supabase link --project-ref YOUR_PROJECT_REF
-```
-3. Deploy:
-```bash
-supabase functions deploy reddit-monitor
-```
-
-**Set environment variables:**
-
-Go to Supabase Dashboard → Edge Functions → reddit-monitor → Secrets, and add:
-
-| Key | Value |
-|---|---|
-| `REDDIT_MONITOR_TG_TOKEN` | Your Telegram bot token |
-| `REDDIT_MONITOR_TG_CHAT_ID` | Your Telegram chat id |
-| `ANTHROPIC_API_KEY` | Your Anthropic API key (sk-ant-...) |
-| `REDDIT_MONITOR_CRON_SECRET` | A random string (same as `supabaseAuthToken` in config.js) |
-
-That's it for Secrets. Keywords, prompts, and limits are all managed in `config.js` and sent to the edge function with each request.
-
-### Step 5: Configure your settings
-
-Edit `config.js`:
-
-1. **subreddits** - Add the subreddits you want to monitor
-2. **keywords** - Add keywords that match posts relevant to you
-3. **supabaseUrl** - Your Supabase function URL (`https://YOUR_PROJECT.supabase.co/functions/v1/reddit-monitor?debug=1`)
-4. **supabaseAuthToken** - Same random string you set as `REDDIT_MONITOR_CRON_SECRET`
-5. **scorePrompt** - Describe YOUR persona, expertise, and angles
-6. **draftPrompt** - Describe YOUR writing style and product mention rules
-7. **dailyDraftLimit** - Max drafts per day (default: 8)
-8. **maxPerRun** - Max drafts per run (default: 3)
-9. **minScore** - Minimum score to generate a draft (default: 6)
-
-### Step 6: Test
 
 ```bash
-node scraper.js
+git clone https://github.com/Palicz91/reddit-monitor.git
+cd reddit-monitor/reddit-monitor
+cp .env.example .env        # then put the secret you were given into RM_SECRET
+./install-mac.sh run        # one test run in the terminal
+./install-mac.sh            # install: runs every 3 hours, catches up after sleep
 ```
 
-You should see posts being scraped and a response from Supabase. Check Telegram for draft messages.
+- Log: `tail -f ~/Library/Logs/reddit-monitor.log`
+- Remove: `./install-mac.sh uninstall`
+- Tests: `npm test`
 
-### Step 7: Set up cron
+The Mac must be awake and online for a run. The backend looks back 36 hours, so a laptop
+that sleeps overnight still catches everything when it wakes. Posts are never sent twice.
 
-Run every 3 hours while your laptop is open:
+## Changing what is searched
 
-**Mac/Linux:**
-```bash
-# Check your node path first
-which node
-
-# Set up cron (replace /usr/local/bin/node with your path)
-echo "0 8,11,14,17,20,23 * * * cd ~/desktop/scraper/reddit-monitor && /usr/local/bin/node scraper.js >> ~/reddit-monitor.log 2>&1" | crontab -
-
-# Verify
-crontab -l
-```
-
-**Windows (Task Scheduler):**
-1. Open Task Scheduler
-2. Create Basic Task → name it "Reddit Monitor"
-3. Trigger: Daily, repeat every 3 hours
-4. Action: Start a program → `node`, arguments: `scraper.js`, start in: `C:\path\to\desktop\scraper\reddit-monitor`
-
-## Customizing the AI
-
-The two most important things to customize are the **scoring prompt** and **draft prompt** in `config.js`.
-
-### Scoring prompt
-
-This tells the AI who you are and what posts are relevant. Be specific about:
-- Your expertise and unique angles
-- What topics you have NOTHING to say about (score 0)
-- Tell it to be harsh. Most posts should score low.
-
-### Draft prompt
-
-This controls the voice of your comments. Include:
-- Your background and what you can authentically share
-- Your writing style (casual? formal? short? long?)
-- Rules for when to mention your product (if ever)
-- Specific data points or stories the AI can reference
-
-## Costs
-
-| Component | Monthly cost |
-|---|---|
-| Reddit scraping | $0 (your laptop) |
-| Supabase | $0 (free tier) |
-| Claude Haiku (scoring) | ~$0.30 |
-| Claude Sonnet (drafts) | ~$1.50 |
-| Telegram | $0 |
-| **Total** | **~$2/month** |
-
-## FAQ
-
-**Does this need my Reddit login?**
-No. It scrapes old.reddit.com without authentication from your residential IP.
-
-**What if my laptop is closed?**
-The cron job won't run. No posts are lost, you just don't get drafts for that period. It picks back up when you open your laptop.
-
-**Can I change subreddits/keywords without redeploying?**
-Yes. Everything is in `config.js` locally. Edit and save, the next cron run picks it up. No Supabase redeploy needed.
-
-**What if Reddit blocks me?**
-Unlikely with residential IP and polite rate limiting (2-4 second delays). If it happens, the scraper logs 403 errors and skips that subreddit.
-
-**Can I use this for multiple people?**
-Each person needs their own Supabase project and config. The edge function code is the same.
-
-## File structure
-
-```
-reddit-monitor/
-├── config.js          ← YOUR settings (subreddits, prompts, limits, etc)
-├── scraper.js         ← Runs on your laptop (cron)
-├── setup.sql          ← Database tables (run once)
-├── package.json
-├── README.md
-└── supabase/
-    └── functions/
-        └── reddit-monitor/
-            └── index.ts  ← Edge function (deploy to Supabase)
-```
+Search phrases and subreddits live in the backend (`supabase/functions/reddit-monitor/logic.ts`
+in the ReviewTactic repo). The list in `scraper.mjs` is only used when the backend can't be reached.
