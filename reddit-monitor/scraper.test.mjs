@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildUrls, dedupe, fetchListing, loadEnv, redditHeaders, toPost } from './scraper.mjs';
+import { buildUrls, dedupe, fetchListing, loadEnv, toPost, toResponse } from './scraper.mjs';
 
 const now = Date.now() / 1000;
 const child = (over = {}) => ({
@@ -67,16 +67,6 @@ test('loadEnv reads export-prefixed and quoted values, ignores comments', () => 
   assert.deepEqual(loadEnv(join(dir, 'missing')), {});
 });
 
-test('redditHeaders: bare value becomes reddit_session, full header kept, none without cookie', () => {
-  assert.equal(redditHeaders('').Cookie, undefined);
-  assert.equal(redditHeaders(undefined).Cookie, undefined);
-  assert.equal(redditHeaders('eyJhbGciOi.eyJzdWIi.c2ln').Cookie, 'reddit_session=eyJhbGciOi.eyJzdWIi.c2ln');
-  assert.equal(redditHeaders('eyJhbGciOi.eyJzdWIi.c2ln=').Cookie, 'reddit_session=eyJhbGciOi.eyJzdWIi.c2ln=');
-  assert.equal(redditHeaders('  Cookie: loid=1; reddit_session=abc ').Cookie, 'loid=1; reddit_session=abc');
-  assert.equal(redditHeaders('reddit_session=abc').Cookie, 'reddit_session=abc');
-  assert.match(redditHeaders('x')['User-Agent'], /Mozilla/);
-});
-
 const fakeRes = (status, body, headers = {}) => ({
   status,
   headers: { get: (k) => headers[k] ?? null },
@@ -113,20 +103,23 @@ test('fetchListing: HTML login page with 200 counts as failed login wall', async
   assert.equal(h.loginWall, true);
 });
 
-test('fetchListing: JSON listing is read and the cookie header is sent', async () => {
+test('fetchListing reads a JSON listing through a page-context response', async () => {
   const h = newHealth();
-  let sent;
-  const out = await fetchListing(
-    'u',
-    h,
-    async (_url, init) => {
-      sent = init.headers;
-      return fakeRes(200, JSON.stringify({ data: { children: [{ kind: 't3', data: {} }] } }));
-    },
-    redditHeaders('abc')
+  const out = await fetchListing('u', h, async () =>
+    toResponse({
+      status: 200,
+      headers: { 'x-ratelimit-reset': null },
+      text: JSON.stringify({ data: { children: [{ kind: 't3', data: {} }] } }),
+    })
   );
   assert.equal(out.length, 1);
   assert.equal(h.ok, 1);
   assert.equal(h.loginWall, undefined);
-  assert.equal(sent.Cookie, 'reddit_session=abc');
+  assert.equal(h.lastStatus, 200);
+});
+
+test('toResponse exposes headers case-insensitively and the 429 path retries once', async () => {
+  const r = toResponse({ status: 429, headers: { 'x-ratelimit-reset': '1' }, text: '' });
+  assert.equal(r.headers.get('X-Ratelimit-Reset'), '1');
+  assert.equal(r.headers.get('missing'), null);
 });

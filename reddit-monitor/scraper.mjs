@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // Reddit monitor, laptop side. Runs from launchd on a Mac. Since Nov 2026 Reddit blocks
-// every logged-out read ("blocked by network security"), from home connections too, so
-// requests carry the Reddit login cookie from .env (REDDIT_COOKIE).
+// every logged-out read ("blocked by network security") and every non-browser client
+// (curl and Node fetch still got 403 with a login cookie), from home connections too.
+// So requests go through the Mac's real Google Chrome (playwright-core, no bundled browser)
+// with its own profile that you log into once: `./install-mac.sh login`.
 //
 // One run:
 //   1. GET the backend for this run's settings (search queries, subreddits, lookback).
@@ -18,7 +20,9 @@
 // Config: .env next to this file (see .env.example). Node 18+, no dependencies.
 
 import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -30,16 +34,67 @@ const USER_AGENT =
 /** Reddit's block pages for logged-out or rejected-login requests (two wordings seen, Nov 2026). */
 export const LOGIN_WALL_RE = /blocked by network security|blocked due to a network policy|try logging in/i;
 
+const DEFAULT_PROFILE_DIR = join(homedir(), 'Library', 'Application Support', 'reddit-monitor', 'chrome-profile');
+
+/** Wraps a page-context fetch result in the small Response shape fetchListing reads. */
+export function toResponse(r) {
+  return {
+    status: r.status,
+    headers: { get: (k) => (r.headers || {})[String(k).toLowerCase()] ?? null },
+    text: async () => r.text,
+  };
+}
+
 /**
- * Request headers. REDDIT_COOKIE is either the reddit_session value on its own, or a whole
- * Cookie header copied from the browser ("name=value; name2=value2"). Never logged or sent
- * anywhere but reddit.com.
+ * Opens Chrome with the monitor's own profile and returns a fetch that runs inside a
+ * reddit.com tab, so Reddit sees a normal logged-in browser. `visible` shows the window
+ * (login); otherwise Chrome runs headless. CHROME_PATH / PROFILE_DIR override the defaults.
  */
-export function redditHeaders(cookie) {
-  const headers = { 'User-Agent': USER_AGENT, Accept: 'application/json' };
-  const c = String(cookie || '').trim().replace(/^cookie:\s*/i, '');
-  if (c) headers.Cookie = /^[A-Za-z_][\w-]*=/.test(c) || c.includes(';') ? c : `reddit_session=${c}`;
-  return headers;
+export async function openBrowser(env, { visible = false } = {}) {
+  let chromium;
+  try {
+    ({ chromium } = await import('playwright-core'));
+  } catch {
+    throw new Error('browser helper missing: run ./install-mac.sh once (it runs npm install)');
+  }
+  const opts = {
+    headless: !visible && env.BROWSER_HEADLESS !== '0',
+    args: ['--disable-blink-features=AutomationControlled'],
+    ignoreDefaultArgs: ['--enable-automation'],
+    viewport: { width: 1280, height: 900 },
+  };
+  if (env.CHROME_PATH) opts.executablePath = env.CHROME_PATH;
+  else opts.channel = 'chrome';
+  if (opts.headless) opts.userAgent = USER_AGENT; // headless Chrome says "HeadlessChrome" otherwise
+  let context;
+  try {
+    context = await chromium.launchPersistentContext(env.PROFILE_DIR || DEFAULT_PROFILE_DIR, opts);
+  } catch (err) {
+    const msg = String(err.message || err);
+    if (/ProcessSingleton|SingletonLock|already in use/i.test(msg)) {
+      throw new Error('the monitor Chrome profile is already open (a login window or another run); close it and retry');
+    }
+    if (/chrome.*(not found|is not found|distribution)/i.test(msg)) {
+      throw new Error('Google Chrome not found: install it from google.com/chrome');
+    }
+    throw err;
+  }
+  const page = context.pages()[0] || (await context.newPage());
+  const fetchImpl = async (url) => {
+    if (!page.url().startsWith('https://www.reddit.com')) {
+      await page.goto('https://www.reddit.com/', { waitUntil: 'domcontentloaded', timeout: 45_000 }).catch(() => {});
+    }
+    const r = await page.evaluate(async (u) => {
+      const res = await fetch(u, { credentials: 'include', headers: { Accept: 'application/json' } });
+      return {
+        status: res.status,
+        headers: { 'x-ratelimit-reset': res.headers.get('x-ratelimit-reset') },
+        text: await res.text(),
+      };
+    }, url);
+    return toResponse(r);
+  };
+  return { context, page, fetchImpl, close: () => context.close().catch(() => {}) };
 }
 
 // Used only when the backend GET fails, so a backend hiccup still yields a useful run.
@@ -127,11 +182,11 @@ export function buildUrls(settings) {
 }
 
 /** Fetch one listing. One retry after a 429, waiting what Reddit asks for (capped). */
-export async function fetchListing(url, health, fetchImpl = fetch, headers = redditHeaders()) {
+export async function fetchListing(url, health, fetchImpl = fetch) {
   for (let attempt = 0; attempt < 2; attempt++) {
     let res;
     try {
-      res = await fetchImpl(url, { headers });
+      res = await fetchImpl(url, { headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' } });
     } catch (err) {
       health.errors.push(`network: ${err.message}`.slice(0, 200));
       health.failed++;
@@ -185,34 +240,43 @@ async function getSettings(endpoint, secret) {
   }
 }
 
-function loginHint(cookie) {
-  return cookie
-    ? 'Reddit no longer accepts the login in REDDIT_COOKIE: copy a fresh one (README, "Reddit login").'
-    : 'Reddit needs a login: add REDDIT_COOKIE to .env (README, "Reddit login").';
+const LOGIN_HINT = 'Reddit wants a login: run ./install-mac.sh login and log in in the Chrome window.';
+
+/** `node scraper.mjs login`: visible Chrome on the monitor profile; you log in, press Enter. */
+async function login(env) {
+  const b = await openBrowser(env, { visible: true });
+  await b.page.goto('https://www.reddit.com/login/', { waitUntil: 'domcontentloaded' }).catch(() => {});
+  console.log('👉 Log in to Reddit in the Chrome window that just opened (a spare account is fine).');
+  console.log('   When you see your Reddit home page, come back here and press Enter.');
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  await new Promise((r) => rl.question('', () => r()));
+  rl.close();
+  await b.close();
+  await check(env);
 }
 
-/** `node scraper.mjs check`: one Reddit request, prints whether the login works. No backend call. */
-async function check(cookie) {
+/** `node scraper.mjs check`: one Reddit request through Chrome; says whether reading works. No backend call. */
+async function check(env) {
+  const b = await openBrowser(env);
   const health = { requests: 1, ok: 0, failed: 0, statuses: {}, errors: [] };
-  const children = await fetchListing(
-    'https://www.reddit.com/r/GoogleMyBusiness/new.json?limit=5&raw_json=1',
-    health,
-    fetch,
-    redditHeaders(cookie)
-  );
+  let children = [];
+  try {
+    children = await fetchListing('https://www.reddit.com/r/GoogleMyBusiness/new.json?limit=5&raw_json=1', health, b.fetchImpl);
+  } finally {
+    await b.close();
+  }
   if (health.ok) {
     console.log(`✅ Reddit OK (HTTP ${health.lastStatus}, ${children.length} posts read).`);
     return;
   }
-  console.log(`❌ Reddit refused (HTTP ${health.lastStatus ?? 'none'}). ${health.loginWall ? loginHint(cookie) : health.errors.join('; ')}`);
-  process.exit(1);
+  console.log(`❌ Reddit refused (HTTP ${health.lastStatus ?? 'none'}). ${health.loginWall ? LOGIN_HINT : health.errors.join('; ')}`);
+  process.exitCode = 1;
 }
 
 async function main() {
   const env = { ...loadEnv(join(HERE, '.env')), ...process.env };
-  const cookie = env.REDDIT_COOKIE;
-  if (process.argv[2] === 'check') return check(cookie);
-  if (!cookie) console.log('⚠️ REDDIT_COOKIE is not set; Reddit blocks logged-out reads (README, "Reddit login").');
+  if (process.argv[2] === 'login') return login(env);
+  if (process.argv[2] === 'check') return check(env);
   const endpoint = env.RM_ENDPOINT;
   const secret = env.RM_SECRET;
   if (!endpoint || !secret) {
@@ -229,18 +293,31 @@ async function main() {
   const urls = buildUrls(settings);
   const health = { requests: urls.length, ok: 0, failed: 0, statuses: {}, errors: [], settingsFromBackend: fromBackend };
   let posts = [];
-  for (const [i, url] of urls.entries()) {
-    const headers = redditHeaders(cookie);
-    const children = await fetchListing(url, health, fetch, headers);
-    const kept = children.map((c) => toPost(c, cutoffUtc)).filter(Boolean);
-    console.log(`  HTTP ${health.lastStatus ?? '-'} ${url.replace('https://www.reddit.com', '').slice(0, 84)} → ${children.length} items, ${kept.length} kept`);
-    posts.push(...kept);
-    if (i < urls.length - 1) await sleep(REQUEST_GAP_MS + Math.random() * 1500);
+  let browser;
+  try {
+    browser = await openBrowser(env);
+  } catch (err) {
+    // Still report to the backend: ok = 0 makes it send the "blocked" Telegram alert.
+    console.log(`❌ ${err.message}`);
+    health.failed = urls.length;
+    health.errors.push(`browser: ${err.message}`.slice(0, 200));
+    browser = { fetchImpl: null, close: async () => {} };
+  }
+  try {
+    for (const [i, url] of (browser.fetchImpl ? urls : []).entries()) {
+      const children = await fetchListing(url, health, browser.fetchImpl);
+      const kept = children.map((c) => toPost(c, cutoffUtc)).filter(Boolean);
+      console.log(`  HTTP ${health.lastStatus ?? '-'} ${url.replace('https://www.reddit.com', '').slice(0, 84)} → ${children.length} items, ${kept.length} kept`);
+      posts.push(...kept);
+      if (i < urls.length - 1) await sleep(REQUEST_GAP_MS + Math.random() * 1500);
+    }
+  } finally {
+    await browser.close();
   }
   posts = dedupe(posts);
   health.durationS = Math.round((Date.now() - started) / 1000);
   console.log(`📊 ${health.ok}/${urls.length} requests ok, ${posts.length} posts in the last ${lookbackHours}h`);
-  if (health.loginWall) console.log(`❌ ${loginHint(cookie)}`);
+  if (health.loginWall) console.log(`❌ ${LOGIN_HINT}`);
 
   let res;
   try {

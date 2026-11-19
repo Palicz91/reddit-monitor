@@ -5,7 +5,8 @@
 #   ./install-mac.sh            install or update
 #   ./install-mac.sh uninstall  remove
 #   ./install-mac.sh run        run once now in this terminal (to test)
-#   ./install-mac.sh check      one Reddit request: does the login in .env work?
+#   ./install-mac.sh login      open Chrome on the monitor's own profile to log in to Reddit (once)
+#   ./install-mac.sh check      one Reddit request through that Chrome: does reading work?
 set -euo pipefail
 
 LABEL="com.reviewtactic.reddit-monitor"
@@ -37,6 +38,25 @@ if [ ! -f "$DIR/.env" ]; then
   exit 1
 fi
 chmod 600 "$DIR/.env"
+
+# Browser helper (playwright-core drives the installed Google Chrome; it downloads no browser).
+NPM="$(dirname "$NODE")/npm"
+[ -x "$NPM" ] || NPM="$(command -v npm || true)"
+WANT="$("$NODE" -p 'require(process.argv[1]).dependencies["playwright-core"]' "$DIR/package.json" 2>/dev/null || true)"
+HAVE="$("$NODE" -p 'require(process.argv[1]).version' "$DIR/node_modules/playwright-core/package.json" 2>/dev/null || true)"
+if [ "$WANT" != "$HAVE" ]; then
+  if [ -z "$NPM" ]; then echo "npm not found (it comes with Node.js)." >&2; exit 1; fi
+  echo "Installing the browser helper (one time, ~10 MB)..."
+  (cd "$DIR" && "$NPM" install --omit=dev --no-audit --no-fund --loglevel=error)
+fi
+if [ ! -d "/Applications/Google Chrome.app" ] && [ ! -d "$HOME/Applications/Google Chrome.app" ]; then
+  echo "Google Chrome not found in Applications. Install it from google.com/chrome first." >&2
+  exit 1
+fi
+
+if [ "${1:-}" = "login" ]; then
+  exec "$NODE" "$DIR/scraper.mjs" login
+fi
 
 if [ "${1:-}" = "check" ]; then
   exec "$NODE" "$DIR/scraper.mjs" check

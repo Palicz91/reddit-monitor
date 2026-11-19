@@ -1,6 +1,6 @@
 {
   "name": "reddit-monitor",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "private": true,
   "description": "Laptop-side Reddit scraper for the ReviewTactic review-removal monitor",
   "type": "module",
@@ -10,5 +10,8 @@
   "scripts": {
     "start": "node scraper.mjs",
     "test": "node --test"
+  },
+  "dependencies": {
+    "playwright-core": "1.64.1"
   }
 }
